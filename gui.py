@@ -736,9 +736,9 @@ class ScraperApp:
                 except Exception:
                     pass
             label = normalized[0] if len(normalized)==1 else f"{len(normalized)}个网页"
-        # ── 线程内立即回调，事件队列已空不堵塞 ──
+        # ── 线程内回调，after(10) 确保不阻塞但比 after_idle 可靠 ──
             self.fetching = False
-            self.root.after_idle(lambda: self._on_fetch_result(label, all_resources))
+            self.root.after(10, lambda: self._on_fetch_result(label, all_resources))
 
         self._fetch_thread = threading.Thread(target=do, daemon=True)
         self._fetch_thread.start()
@@ -781,8 +781,8 @@ class ScraperApp:
             for r in hls:
                 r.checked = True
             self._update_count()
-            self.root.after(500, lambda: self.lbl_status.config(
-                text=f"📻 检测到 HLS 音频流，已自动勾选", fg=GREEN))
+            self.lbl_status.config(
+                text=f"📻 检测到 HLS 音频流，已自动勾选", fg=GREEN)
 
     def _on_fetch_err(self, err):
         self.fetching = False
