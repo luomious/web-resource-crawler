@@ -707,7 +707,9 @@ class ScraperApp:
                 except Exception:
                     pass
             label = normalized[0] if len(normalized)==1 else f"{len(normalized)}个网页"
-            self.root.after(0, lambda: self._on_fetch_ok(label, all_resources))
+            # ⚡ 线程内立即重置 fetching，确保下次抓取不受 UI 事件队列延迟影响
+            self.fetching = False
+            self.root.after(0, lambda: self._on_fetch_result(label, all_resources))
 
         self._fetch_thread = threading.Thread(target=do, daemon=True)
         self._fetch_thread.start()
@@ -732,8 +734,7 @@ class ScraperApp:
             self.btn_pause.config(state="disabled")
             self.btn_stop_dl.config(state="disabled")
 
-    def _on_fetch_ok(self, url, resources):
-        self.fetching = False
+    def _on_fetch_result(self, url, resources):
         self.resources = resources
         self._set_buttons(fetching=False, downloading=self.downloading)
         self.progress.stop()
