@@ -144,22 +144,24 @@ class ScraperApp:
 
     def _start_polling(self):
         """200ms 定时器，从线程共享变量读取最新状态并刷新 UI"""
-        # 检查抓取结果
-        if self._pending_fetch_result:
-            label, resources = self._pending_fetch_result
-            self._pending_fetch_result = None
-            self._on_fetch_result(label, resources)
+        try:
+            # 检查抓取结果
+            if self._pending_fetch_result:
+                label, resources = self._pending_fetch_result
+                self._pending_fetch_result = None
+                self._on_fetch_result(label, resources)
 
-        # 检查下载进度
-        info = self._dl_progress_info
-        if info[0] > 0:
-            total, done, name, pct = info
-            self.progress["value"] = pct
-            self.lbl_progress.config(text=f"{pct}%")
-            color = GREEN if "✅" in name else BLUE
-            self.lbl_status.config(
-                text=f"📥 [{done}/{total}] {name[:35]}", fg=color)
-
+            # 检查下载进度
+            info = self._dl_progress_info
+            if info[0] > 0:
+                total, done, name, pct = info
+                self.progress["value"] = pct
+                self.lbl_progress.config(text=f"{pct}%")
+                color = GREEN if "✅" in name else BLUE
+                self.lbl_status.config(
+                    text=f"📥 [{done}/{total}] {name[:35]}", fg=color)
+        except Exception:
+            pass  # 轮询器永不崩溃
         self.root.after(200, self._start_polling)
 
     # ── UI 构建 ──────────────────────────────────────────
@@ -202,7 +204,9 @@ class ScraperApp:
         )
 
         self.cmb_url.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 4))
-        # 浏览器地址栏行为 — 不自动弹出下拉
+        # 输入框变更监听：清空时清除资源列表
+        self.var_url.trace_add("write", lambda *a: self._on_url_change())
+        # 浏览器地址栏行为
         self.cmb_url.bind("<Return>", lambda e: self._fetch())
         self.cmb_url.bind("<FocusIn>", lambda e: self.root.after(50, lambda: self.cmb_url.select_range(0, "end")))
         self.cmb_url.bind("<Button-1>", lambda e: self.root.after(10, self._url_click))
@@ -689,7 +693,15 @@ class ScraperApp:
         self.suggest_box.activate(idx)
 
     def _on_url_type(self):
-        pass  # 不自动弹出下拉
+        pass
+
+    def _on_url_change(self):
+        """输入框清空时清除资源列表"""
+        if not self.var_url.get().strip():
+            self.resources = []
+            self._clear_list()
+            self._show_preview_empty()
+            self.lbl_status.config(text="", fg=FG2)
 
     # ── 抓取（支持多 URL，独立线程永不阻塞）─────────────
     def _fetch(self):
