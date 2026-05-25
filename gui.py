@@ -179,13 +179,12 @@ class ScraperApp:
         )
 
         self.cmb_url.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 4))
-        # 浏览器地址栏行为
+        # 浏览器地址栏行为 — 不自动弹出下拉
         self.cmb_url.bind("<Return>", lambda e: self._fetch())
-        self.cmb_url.bind("<FocusIn>", lambda e: (self._show_suggestions(), self.root.after(50, lambda: self.cmb_url.select_range(0, "end"))))
-        self.cmb_url.bind("<Button-1>", lambda e: (self._show_suggestions(), self.root.after(10, self._url_click)))
+        self.cmb_url.bind("<FocusIn>", lambda e: self.root.after(50, lambda: self.cmb_url.select_range(0, "end")))
+        self.cmb_url.bind("<Button-1>", lambda e: self.root.after(10, self._url_click))
         self.cmb_url.bind("<Control-a>", lambda e: self.cmb_url.select_range(0, "end"))
         self.cmb_url.bind("<Escape>", lambda e: (self.cmb_url.select_clear(), self._hide_suggestions()))
-        self.cmb_url.bind("<KeyRelease>", lambda e: self._on_url_type())
         self.cmb_url.bind("<Down>", lambda e: self._nav_suggestions(1))
         self.cmb_url.bind("<Up>", lambda e: self._nav_suggestions(-1))
 
@@ -331,25 +330,40 @@ class ScraperApp:
 
     # ── 路径更新 ──────────────────────────────────────────
     def _build_sidebar(self, parent):
-        """左侧下载记录侧边栏"""
-        sidebar = tk.Frame(parent, bg=BG1, width=195, highlightbackground=BORDER, highlightthickness=1)
+        """左侧下载管理器（百度网盘风格）"""
+        sidebar = tk.Frame(parent, bg=BG1, width=210, highlightbackground=BORDER, highlightthickness=1)
         sidebar.pack(side="left", fill="y", padx=(0, 4))
         sidebar.pack_propagate(False)
 
         # 标题
-        tk.Label(sidebar, text="📋 下载记录", fg=FG, bg=BG1, font=("Segoe UI", 9, "bold")).pack(pady=(10, 6))
+        tk.Label(sidebar, text="📥 下载管理", fg=FG, bg=BG1, font=("Segoe UI", 9, "bold")).pack(pady=(10, 8))
 
-        # 标签切换按钮行
+        # 标签切换：下载中(N) / 已完成(N)
         tab_row = tk.Frame(sidebar, bg=BG1)
-        tab_row.pack(fill="x", padx=6, pady=(0, 6))
-        self.btn_tab_active = tk.Label(tab_row, text="🔄 进行中", bg="#1f6feb", fg="white",
-                                        font=FONT_SM, padx=6, pady=3, cursor="hand2")
+        tab_row.pack(fill="x", padx=6, pady=(0, 8))
+        active_count = sum(1 for d in self.download_log if "中" in d[2])
+        done_count = sum(1 for d in self.download_log if "中" not in d[2])
+        self.btn_tab_active = tk.Label(tab_row, text=f"下载中({active_count})", bg="#1f6feb", fg="white",
+                                        font=FONT_SM, padx=4, pady=4, cursor="hand2")
         self.btn_tab_active.pack(side="left", fill="x", expand=True, padx=(0, 2))
         self.btn_tab_active.bind("<Button-1>", lambda e: self._switch_dl_tab("进行中"))
-        self.btn_tab_done = tk.Label(tab_row, text="✅ 已完成", bg=BG2, fg=FG2,
-                                      font=FONT_SM, padx=6, pady=3, cursor="hand2")
+        self.btn_tab_done = tk.Label(tab_row, text=f"已完成({done_count})", bg=BG2, fg=FG2,
+                                      font=FONT_SM, padx=4, pady=4, cursor="hand2")
         self.btn_tab_done.pack(side="left", fill="x", expand=True, padx=(2, 0))
         self.btn_tab_done.bind("<Button-1>", lambda e: self._switch_dl_tab("已完成"))
+
+        # 控制按钮行
+        ctrl_row = tk.Frame(sidebar, bg=BG1)
+        ctrl_row.pack(fill="x", padx=6, pady=(0, 6))
+        tk.Label(ctrl_row, text="全部暂停", fg=BLUE, bg=BG1, font=FONT_SM,
+                 cursor="hand2").pack(side="left", padx=(0, 6))
+        tk.Label(ctrl_row, text="全部开始", fg=GREEN, bg=BG1, font=FONT_SM,
+                 cursor="hand2").pack(side="left", padx=(0, 6))
+        tk.Label(ctrl_row, text="全部删除", fg=RED, bg=BG1, font=FONT_SM,
+                 cursor="hand2").pack(side="left")
+        # bind commands
+        ctrl_row.winfo_children()[0].bind("<Button-1>", lambda e: self._toggle_pause())
+        ctrl_row.winfo_children()[2].bind("<Button-1>", lambda e: self._clear_dl_log())
 
         # 滚动日志区
         dl_canvas = tk.Canvas(sidebar, bg=BG1, highlightthickness=0)
@@ -357,7 +371,7 @@ class ScraperApp:
         self.dl_log_frame = tk.Frame(dl_canvas, bg=BG1)
         self.dl_log_frame.bind("<Configure>", lambda e: dl_canvas.configure(
             scrollregion=dl_canvas.bbox("all")))
-        dl_canvas.create_window((0, 0), window=self.dl_log_frame, anchor="nw")
+        dl_canvas.create_window((0, 0), window=self.dl_log_frame, anchor="nw", width=195)
         dl_canvas.configure(yscrollcommand=dl_scroll.set)
         dl_canvas.pack(side="left", fill="both", expand=True)
         dl_scroll.pack(side="right", fill="y")
@@ -367,17 +381,29 @@ class ScraperApp:
 
     def _switch_dl_tab(self, tab):
         self.download_tab = tab
+        active_count = sum(1 for d in self.download_log if "中" in d[2])
+        done_count = sum(1 for d in self.download_log if "中" not in d[2])
         if tab == "进行中":
-            self.btn_tab_active.config(bg="#1f6feb", fg="white")
-            self.btn_tab_done.config(bg=BG2, fg=FG2)
+            self.btn_tab_active.config(bg="#1f6feb", fg="white", text=f"下载中({active_count})")
+            self.btn_tab_done.config(bg=BG2, fg=FG2, text=f"已完成({done_count})")
         else:
-            self.btn_tab_done.config(bg="#238636", fg="white")
-            self.btn_tab_active.config(bg=BG2, fg=FG2)
+            self.btn_tab_done.config(bg="#238636", fg="white", text=f"已完成({done_count})")
+            self.btn_tab_active.config(bg=BG2, fg=FG2, text=f"下载中({active_count})")
+        self._refresh_sidebar()
+
+    def _clear_dl_log(self):
+        self.download_log.clear()
         self._refresh_sidebar()
 
     def _refresh_sidebar(self):
         for w in self.dl_log_frame.winfo_children():
             w.destroy()
+        active_count = sum(1 for d in self.download_log if "中" in d[2])
+        done_count = sum(1 for d in self.download_log if "中" not in d[2])
+        # 更新 tab 计数
+        self.btn_tab_active.config(text=f"下载中({active_count})")
+        self.btn_tab_done.config(text=f"已完成({done_count})")
+
         items = [d for d in self.download_log if (
             (self.download_tab == "进行中" and "中" in d[2]) or
             (self.download_tab == "已完成" and "中" not in d[2])
@@ -385,9 +411,9 @@ class ScraperApp:
         if not items:
             tk.Label(self.dl_log_frame, text="暂无记录", fg=FG3, bg=BG1, font=FONT_SM).pack(pady=20)
             return
-        for url, fname, status, size in items[-50:]:
+        for url, fname, status, size in items[-100:]:
             color = GREEN if "✅" in status else (ORANGE if "📥" in status else RED)
-            text = f"{status} {fname[:22]}"
+            text = f"{status} {fname[:20]}"
             tk.Label(self.dl_log_frame, text=text, fg=color, bg=BG1,
                      font=("Consolas", 7), anchor="w", justify="left",
                      wraplength=175, pady=1).pack(fill="x", padx=6)
@@ -640,8 +666,7 @@ class ScraperApp:
         self.suggest_box.activate(idx)
 
     def _on_url_type(self):
-        """输入时实时筛选"""
-        self._show_suggestions()
+        pass  # 不自动弹出下拉
 
     # ── 抓取（支持多 URL）────────────────────────────────
     def _fetch(self):
@@ -947,10 +972,11 @@ class ScraperApp:
         def cb(t, done, name):
             pct = min(int(done / t * 100), 100) if t else 0
             self._dl_ui_counter += 1
-            if self._dl_ui_counter % 3 == 0 or "✅" in name:
-                self.root.after(0, lambda: self.progress.configure(value=pct))
-                self.root.after(0, lambda: self.lbl_progress.config(text=f"{pct}%"))
-                self.root.after(0, lambda: self.lbl_status.config(
+            # 极度节流：每 50 次或 10% 进度里程碑才刷新 UI
+            if self._dl_ui_counter % 50 == 0 or pct % 10 == 0 or "✅" in name:
+                self.root.after_idle(lambda: self.progress.configure(value=pct))
+                self.root.after_idle(lambda: self.lbl_progress.config(text=f"{pct}%"))
+                self.root.after_idle(lambda: self.lbl_status.config(
                     text=f"📥 [{done}/{t}] {name[:35]}", fg=GREEN if "✅" in name else BLUE))
             if self.pause_event.is_set():
                 self.root.after(0, lambda: self.lbl_status.config(
