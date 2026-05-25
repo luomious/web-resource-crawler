@@ -134,7 +134,6 @@ class ScraperApp:
         self.settings.setdefault("max_workers", 16)
         self.settings.setdefault("timeout", 30)
         self.settings.setdefault("auto_check_hls", True)
-        self.settings.setdefault("translate", True)
         self.settings.setdefault("theme", "dark")
         self._apply_settings()
 
@@ -510,11 +509,7 @@ class ScraperApp:
                             font=FONT_SM)
         cb.pack(anchor="w", pady=(4, 4))
 
-        # 翻译
-        var_trans = tk.BooleanVar(value=self.settings.get("translate", True))
-        cb2 = tk.Checkbutton(frm, text="将非中文内容翻译为中文（时间轴等）", variable=var_trans,
-                             bg=BG1, fg=FG2, selectcolor=BG0, activebackground=BG1, font=FONT_SM)
-        cb2.pack(anchor="w", pady=(0, 4))
+        # 主题
 
         # 主题
         tk.Label(frm, text="界面主题", fg=FG2, bg=BG1, font=FONT_SM).pack(anchor="w")
@@ -531,7 +526,6 @@ class ScraperApp:
             self.settings["max_workers"] = var_workers.get()
             self.settings["timeout"] = var_timeout.get()
             self.settings["auto_check_hls"] = var_hls.get()
-            self.settings["translate"] = var_trans.get()
             self.settings["theme"] = var_theme.get()
             cfg = _load_config()
             cfg["settings"] = self.settings
@@ -964,14 +958,6 @@ class ScraperApp:
                 self.pause_event.wait()
 
         def do():
-            # 翻译章节（如果设置开启）
-            if self.settings.get("translate", True):
-                for r in checked:
-                    if getattr(r, 'chapters', None):
-                        from core.scraper import translate_chapters
-                        r.chapters = translate_chapters(r.chapters)
-                        self.root.after(0, lambda: self.lbl_status.config(
-                            text="🌐 时间轴已翻译为中文", fg=BLUE))
             results = download_all(checked, self.save_dir,
                                    stop_flag=self.stop_flag, progress_cb=cb)
             ok_list, fail_list, stopped_list = [], [], []
