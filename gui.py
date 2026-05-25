@@ -5,6 +5,7 @@
 import json
 import pathlib
 import re
+import queue
 import threading
 from urllib.parse import urlparse
 
@@ -128,8 +129,8 @@ class ScraperApp:
         self.history = _load_history()
         self.download_log = []  # [(url, filename, status, size_str), ...]
         self.download_tab = "进行中"  # 下载侧边栏当前标签页
-        self._pending_fetch_result = None  # 共享抓取结果
-        self._dl_progress_info = [0, 0, "", 0]  # [total, done, name, pct] 线程写入，定时器读取
+        self._fetch_queue = queue.Queue()  # 线程安全队列，传递抓取结果
+        self._dl_progress_info = [0, 0, "", 0]
 
         # 加载设置
         self.settings = _load_config().get("settings", {})
@@ -143,15 +144,14 @@ class ScraperApp:
         self._start_polling()  # 启动统一轮询，线程安全刷新 UI
 
     def _start_polling(self):
-        """200ms 定时器，从线程共享变量读取最新状态并刷新 UI"""
+        """100ms 定时器：队列读抓取结果 + 刷新下载进度"""
         try:
-            # 检查抓取结果
-            if self._pending_fetch_result:
-                label, resources = self._pending_fetch_result
-                self._pending_fetch_result = None
-                self._on_fetch_result(label, resources)
-
-            # 检查下载进度
+            while not self._fetch_queue.empty():
+                try:
+                    label, resources = self._fetch_queue.get_nowait()
+                    self._on_fetch_result(label, resources)
+                except:
+                    break
             info = self._dl_progress_info
             if info[0] > 0:
                 total, done, name, pct = info
@@ -161,8 +161,8 @@ class ScraperApp:
                 self.lbl_status.config(
                     text=f"📥 [{done}/{total}] {name[:35]}", fg=color)
         except Exception:
-            pass  # 轮询器永不崩溃
-        self.root.after(200, self._start_polling)
+            pass
+        self.root.after(100, self._start_polling)
 
     # ── UI 构建 ──────────────────────────────────────────
     def _build_ui(self):
@@ -738,7 +738,7 @@ class ScraperApp:
             label = normalized[0] if len(normalized)==1 else f"{len(normalized)}个网页"
         # ── 线程内回调，after(10) 确保不阻塞但比 after_idle 可靠 ──
             self.fetching = False
-            self.root.after(10, lambda: self._on_fetch_result(label, all_resources))
+            self._fetch_queue.put((label, all_resources))  # 通过队列传递，轮询器读取
 
         self._fetch_thread = threading.Thread(target=do, daemon=True)
         self._fetch_thread.start()
