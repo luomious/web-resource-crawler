@@ -128,6 +128,8 @@ class ScraperApp:
         self.history = _load_history()
         self.download_log = []  # [(url, filename, status, size_str), ...]
         self.download_tab = "进行中"  # 下载侧边栏当前标签页
+        self._pending_fetch_result = None  # 共享抓取结果
+        self._dl_progress_info = [0, 0, "", 0]  # [total, done, name, pct] 线程写入，定时器读取
 
         # 加载设置
         self.settings = _load_config().get("settings", {})
@@ -138,6 +140,27 @@ class ScraperApp:
         self._apply_settings()
 
         self._build_ui()
+        self._start_polling()  # 启动统一轮询，线程安全刷新 UI
+
+    def _start_polling(self):
+        """200ms 定时器，从线程共享变量读取最新状态并刷新 UI"""
+        # 检查抓取结果
+        if self._pending_fetch_result:
+            label, resources = self._pending_fetch_result
+            self._pending_fetch_result = None
+            self._on_fetch_result(label, resources)
+
+        # 检查下载进度
+        info = self._dl_progress_info
+        if info[0] > 0:
+            total, done, name, pct = info
+            self.progress["value"] = pct
+            self.lbl_progress.config(text=f"{pct}%")
+            color = GREEN if "✅" in name else BLUE
+            self.lbl_status.config(
+                text=f"📥 [{done}/{total}] {name[:35]}", fg=color)
+
+        self.root.after(200, self._start_polling)
 
     # ── UI 构建 ──────────────────────────────────────────
     def _build_ui(self):
@@ -668,15 +691,13 @@ class ScraperApp:
     def _on_url_type(self):
         pass  # 不自动弹出下拉
 
-    # ── 抓取（支持多 URL）────────────────────────────────
+    # ── 抓取（支持多 URL，独立线程永不阻塞）─────────────
     def _fetch(self):
         raw = self.var_url.get().strip()
         if not raw:
             return
 
-        # 解析多 URL：逗号、换行分隔
-        urls = re.split(r'[,\n]+', raw)
-        urls = [u.strip() for u in urls if u.strip()]
+        urls = [u.strip() for u in re.split(r'[,\n]+', raw) if u.strip()]
         if not urls:
             return
         normalized = [u if u.startswith(("http://","https://")) else "https://"+u for u in urls]
@@ -687,7 +708,6 @@ class ScraperApp:
 
         self.fetching = True
         self.resources = []
-        self._set_buttons(fetching=True, downloading=self.downloading)
         self._clear_list()
         self._show_preview_empty()
         self.lbl_status.config(text=f"⏳ 正在抓取 1/{len(normalized)}...", fg=ORANGE)
@@ -698,17 +718,14 @@ class ScraperApp:
             all_resources = []
             for i, url in enumerate(normalized):
                 try:
-                    self.root.after(0, lambda idx=i: self.lbl_status.config(
-                        text=f"⏳ 抓取 {idx+1}/{len(normalized)}: {url[:50]}...", fg=ORANGE))
                     html = fetch_html(url)
                     res = parse_resources(html, url, source_url=url)
                     all_resources.extend(res)
                 except Exception:
                     pass
             label = normalized[0] if len(normalized)==1 else f"{len(normalized)}个网页"
-            # ⚡ 线程内立即重置 fetching，确保下次抓取不受 UI 事件队列延迟影响
             self.fetching = False
-            self.root.after(0, lambda: self._on_fetch_result(label, all_resources))
+            self._pending_fetch_result = (label, all_resources)  # 共享变量，定时器轮询
 
         self._fetch_thread = threading.Thread(target=do, daemon=True)
         self._fetch_thread.start()
@@ -968,19 +985,11 @@ class ScraperApp:
         if has_hls:
             self.lbl_status.config(text="📻 检测到 HLS，将自动合并为完整文件", fg=BLUE)
 
-        self._dl_ui_counter = 0
+        self._dl_progress_info = [0, 0, "", 0]  # 重置进度
         def cb(t, done, name):
             pct = min(int(done / t * 100), 100) if t else 0
-            self._dl_ui_counter += 1
-            # 极度节流：每 50 次或 10% 进度里程碑才刷新 UI
-            if self._dl_ui_counter % 50 == 0 or pct % 10 == 0 or "✅" in name:
-                self.root.after_idle(lambda: self.progress.configure(value=pct))
-                self.root.after_idle(lambda: self.lbl_progress.config(text=f"{pct}%"))
-                self.root.after_idle(lambda: self.lbl_status.config(
-                    text=f"📥 [{done}/{t}] {name[:35]}", fg=GREEN if "✅" in name else BLUE))
-            if self.pause_event.is_set():
-                self.root.after(0, lambda: self.lbl_status.config(
-                    text=f"⏸ 已暂停 [{done}/{t}]", fg=ORANGE))
+            self._dl_progress_info = [t, done, name, pct]  # 线程写入，轮询读取
+            if "分片" in name and self.pause_event.is_set():
                 self.pause_event.wait()
 
         def do():
@@ -1039,6 +1048,7 @@ class ScraperApp:
     def _on_dl_done(self, ok, fail, stopped):
         self.downloading = False
         self.paused = False
+        self._dl_progress_info = [0, 0, "", 0]  # 清除进度
 
         # 更新侧边栏日志
         for u, p, sz in ok:
