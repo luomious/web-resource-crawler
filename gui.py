@@ -736,8 +736,9 @@ class ScraperApp:
                 except Exception:
                     pass
             label = normalized[0] if len(normalized)==1 else f"{len(normalized)}个网页"
+        # ── 线程内立即回调，事件队列已空不堵塞 ──
             self.fetching = False
-            self._pending_fetch_result = (label, all_resources)  # 共享变量，定时器轮询
+            self.root.after_idle(lambda: self._on_fetch_result(label, all_resources))
 
         self._fetch_thread = threading.Thread(target=do, daemon=True)
         self._fetch_thread.start()
