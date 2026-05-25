@@ -691,7 +691,6 @@ class ScraperApp:
         self._clear_list()
         self._show_preview_empty()
         self.lbl_status.config(text=f"⏳ 正在抓取 1/{len(normalized)}...", fg=ORANGE)
-        self.btn_fetch.config(text="⏳", state="disabled")
         self.progress["mode"] = "indeterminate"
         self.progress.start(10)
 
@@ -722,9 +721,9 @@ class ScraperApp:
         self.progress["mode"] = "determinate"
 
     def _set_buttons(self, fetching=False, downloading=False):
-        self.btn_fetch.config(state="disabled" if fetching else "normal", text="🔍  抓 取")
+        self.btn_fetch.config(state="normal", text="🔍  抓 取")  # 始终可点，fetching 标志防抖
         self.btn_stop.config(state="normal" if fetching else "disabled")
-        self.cmb_url.config(state="disabled" if fetching else "normal")  # 下载时仍可输入新URL
+        self.cmb_url.config(state="disabled" if fetching else "normal")
         self.btn_download.config(state="disabled" if fetching else (
             "normal" if self.checked_count > 0 and not downloading else "disabled"))
         if downloading:
