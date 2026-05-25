@@ -197,6 +197,8 @@ def download_all(resources: list, save_dir: Path,
             _inc_done()
             return
         safe_name = re.sub(r'[\\/:*?"<>|]', '', r.name)
+        if safe_name.endswith(".m3u8"):
+            safe_name = safe_name[:-5] + ".ts"
         output = save_dir / safe_name
 
         if progress_cb:
