@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 venv/
+*.egg-info/
 
 # IDE
 .vscode/
@@ -14,7 +15,12 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # 项目
 downloads/
 *.merged.ts
+config.json
+
+# PyInstaller
+*.manifest
