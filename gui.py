@@ -240,8 +240,7 @@ class MainWindow(QMainWindow):
             txt = f"[{r.rtype}] {r.name}"
             it = QListWidgetItem(txt)
             it.setData(Qt.UserRole, r)
-            it.setCheckState(Qt.Checked)
-            self.res_list.addItem(it)
+            it.setCheckState(Qt.Unchecked)  # 默认不勾选
 
         self._upd_cnt()
 
@@ -295,9 +294,17 @@ class MainWindow(QMainWindow):
         self.st.setText("📻 开始下载...")
         self.dl_list.clear()
 
-        # 记录下载项到列表
+        # 每个资源一个下载条目
+        self._dl_items = {}  # name → listitem
         for r in checked:
-            self.dl_list.addItem(f"📥 下载中: {r.name}")
+            item = QListWidgetItem(f"⬇ {r.name}")
+            self.dl_list.addItem(item)
+            self._dl_items[r.name] = item
+
+        # 全局进度
+        self.dl_list.addItem("━━━━━━━━━━━━━━━━━")
+        self._global_item = QListWidgetItem("总进度: 0%")
+        self.dl_list.addItem(self._global_item)
 
         self._dl_w = DownloadWorker(checked, self.save_dir, self.stop_flag)
         self._dl_w.progress.connect(self._on_dl_progress)
@@ -305,14 +312,20 @@ class MainWindow(QMainWindow):
         self._dl_w.start()
 
     def _on_dl_progress(self, total, done, name, pct):
-        """下载进度回写"""
+        """下载进度: 更新对应文件名条目 + 全局进度"""
         self.progress.setValue(pct)
-        self.st.setText(f"📥 [{done}/{total}] {name[:30]}")
 
-        # 更新下载列表最后一项
-        cnt = self.dl_list.count()
-        if cnt > 0:
-            self.dl_list.item(cnt - 1).setText(f"[{pct}%] {name[:50]}")
+        # 找匹配的文件条目
+        for key, item in list(self._dl_items.items()):
+            if key[:15] in name or name[:15] in key:
+                prefix = "✅" if pct >= 100 else "⬇"
+                item.setText(f"{prefix} {key} [{pct}%]")
+                break
+
+        # 全局进度
+        if hasattr(self, '_global_item'):
+            self._global_item.setText(f"总进度: [{done}/{total}] {name[:30]}")
+        self.st.setText(f"📥 [{done}/{total}] {name[:30]}")
 
     def _on_dl_done(self, ok, fail, stop):
         self.downloading = False
