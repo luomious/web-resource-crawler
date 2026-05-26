@@ -367,6 +367,44 @@ def _extract_chapters(soup: BeautifulSoup, html: str) -> list[tuple[int, int, st
 
 
 # ══════════════════════════════════════════════════════════
+#  多 URL 并发抓取
+# ══════════════════════════════════════════════════════════
+
+def fetch_all_urls(urls: list[str], max_workers: int = 6) -> list[Resource]:
+    """并发抓取多个 URL，汇总所有资源到一个统一列表（自动去重）。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    all_resources: list[Resource] = []
+    seen_urls: set[str] = set()
+
+    def _fetch_one(url: str) -> list[Resource]:
+        try:
+            html = fetch_html(url)
+            return parse_resources(html, url, source_url=url)
+        except Exception as e:
+            _log.warning(f"[fetch_all] {url[:60]} 抓取失败: {e}")
+            return []
+
+    workers = min(max_workers, len(urls), 8)  # 最多 8 并发，避免被 ban
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, u): u for u in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                resources = future.result()
+                _log.info(f"[fetch_all] {url[:60]} -> {len(resources)} 资源")
+                for r in resources:
+                    if r.url not in seen_urls:
+                        seen_urls.add(r.url)
+                        all_resources.append(r)
+            except Exception as e:
+                _log.warning(f"[fetch_all] {url[:60]} 并发异常: {e}")
+
+    _log.info(f"[fetch_all] 总计 {len(all_resources)} 资源（{len(urls)} 个 URL）")
+    return all_resources
+
+
+# ══════════════════════════════════════════════════════════
 #  翻译工具（日/英 → 中文）
 # ══════════════════════════════════════════════════════════
 
