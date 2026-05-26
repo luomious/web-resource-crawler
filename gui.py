@@ -241,6 +241,7 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(txt)
             it.setData(Qt.UserRole, r)
             it.setCheckState(Qt.Unchecked)  # 默认不勾选
+            self.res_list.addItem(it)
 
         self._upd_cnt()
 
@@ -250,7 +251,7 @@ class MainWindow(QMainWindow):
             if ftype is None or r.rtype == ftype:
                 it = QListWidgetItem(f"[{r.rtype}] {r.name}")
                 it.setData(Qt.UserRole, r)
-                it.setCheckState(Qt.Checked if getattr(r, 'checked', True) else Qt.Unchecked)
+                it.setCheckState(Qt.Unchecked)  # 过滤后也不勾选
                 self.res_list.addItem(it)
         self._upd_cnt()
 
@@ -312,17 +313,25 @@ class MainWindow(QMainWindow):
         self._dl_w.start()
 
     def _on_dl_progress(self, total, done, name, pct):
-        """下载进度: 更新对应文件名条目 + 全局进度"""
+        """下载进度: 实时刷新进度条和文件名"""
         self.progress.setValue(pct)
 
-        # 找匹配的文件条目
+        # 找匹配的文件条目更新
+        matched = False
         for key, item in list(self._dl_items.items()):
-            if key[:15] in name or name[:15] in key:
+            if key[:10] in name or name[:10] in key:
                 prefix = "✅" if pct >= 100 else "⬇"
-                item.setText(f"{prefix} {key} [{pct}%]")
+                item.setText(f"{prefix} {key[:30]} [{pct}%]")
+                matched = True
                 break
 
-        # 全局进度
+        if not matched and hasattr(self, '_dl_items'):
+            # 无匹配时更新第一个未完成的条目
+            for key, item in self._dl_items.items():
+                if "⬇" in item.text():
+                    item.setText(f"⬇ {key[:30]} [{pct}%]")
+                    break
+
         if hasattr(self, '_global_item'):
             self._global_item.setText(f"总进度: [{done}/{total}] {name[:30]}")
         self.st.setText(f"📥 [{done}/{total}] {name[:30]}")
@@ -330,24 +339,22 @@ class MainWindow(QMainWindow):
     def _on_dl_done(self, ok, fail, stop):
         self.downloading = False
         self.progress.setValue(100)
-        self.st.setText(f"✅ 完成: 成功 {len(ok)} 项, 失败 {len(fail)} 项")
 
-        # 更新下载列表
+        # 清空并显示最终结果
         self.dl_list.clear()
         for _, path, sz in ok:
             fname = pathlib.Path(path).name
             sz_str = f"{sz/1024/1024:.1f}MB" if sz > 1024*1024 else f"{sz/1024:.0f}KB"
             self.dl_list.addItem(f"✅ {fname} ({sz_str})")
         for _, err in fail:
-            self.dl_list.addItem(f"❌ {err[:50]}")
+            self.dl_list.addItem(f"❌ {err[:60]}")
 
-        msg = f"下载完成!\n\n成功: {len(ok)} 项\n失败: {len(fail)} 项"
-        if stop:
-            msg += f"\n取消: {len(stop)} 项"
-        QMessageBox.information(self, "下载结果", msg)
+        self.st.setText(f"✅ 完成: 成功 {len(ok)}, 失败 {len(fail)}")
+        QMessageBox.information(self, "下载结果", f"成功: {len(ok)} 项\n失败: {len(fail)} 项")
 
     def _stop_dl(self):
         self.stop_flag.set()
+        self.st.setText("⏹ 正在停止...")
 
     def _change_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择保存目录", str(self.save_dir))
