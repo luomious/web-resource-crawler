@@ -61,7 +61,9 @@ def _make_session() -> requests.Session:
 
 
 def fetch_html(url: str) -> str:
-    """下载页面 HTML"""
+    """下载页面 HTML。asmr.one 不需要 HTML，返回空字符串即可"""
+    if _is_asmr_one(url):
+        return ""  # 由 parse_resources 直接调用 API
     s = _make_session()
     headers = {
         "User-Agent": USER_AGENTS[0],
@@ -204,6 +206,10 @@ def parse_resources(html: str, base_url: str, source_url: str = "") -> list[Reso
     """解析 HTML，提取所有可用资源"""
     resources = []
     seen_urls = set()
+
+    # ── 0. asmr.one API 解析 ────────────────────────
+    if _is_asmr_one(base_url):
+        return _parse_asmr_one(base_url)
     soup = BeautifulSoup(html, "lxml")
 
     def _add(url, rtype):
@@ -440,4 +446,87 @@ def translate_chapters(chapters: list) -> list:
     for start, end, title in chapters:
         zh = translate_to_zh(title)
         result.append((start, end, title, zh if zh != title else ""))
+    return result
+
+
+# ══════════════════════════════════════════════════════════
+#  asmr.one API 解析
+# ══════════════════════════════════════════════════════════
+
+ASMR_ONE_PATTERN = re.compile(r'asmr\.one/work/(RJ\d+)', re.I)
+ASMR_API_WORK_INFO = "https://api.asmr.one/api/workInfo/{}"
+ASMR_API_TRACKS = "https://api.asmr.one/api/tracks/{}"
+
+
+def _is_asmr_one(url: str) -> bool:
+    return bool(ASMR_ONE_PATTERN.search(url))
+
+
+def _parse_asmr_one(url: str) -> list[Resource]:
+    """通过 asmr.one API 获取所有音视频和字幕资源"""
+    match = ASMR_ONE_PATTERN.search(url)
+    if not match:
+        return []
+    rj = match.group(1)
+    resources = []
+
+    try:
+        # 1. 获取作品元数据 → 拿到数字ID
+        info_r = requests.get(ASMR_API_WORK_INFO.format(rj),
+                              headers={"User-Agent": USER_AGENTS[0]},
+                              timeout=(CONNECT_TIMEOUT, TIMEOUT))
+        info_r.raise_for_status()
+        work_id = info_r.json().get("id")
+        if not work_id:
+            _log.warning(f"[asmr.one] 未找到作品ID: {rj}")
+            return []
+
+        # 2. 获取文件树
+        tracks_r = requests.get(ASMR_API_TRACKS.format(work_id),
+                                headers={"User-Agent": USER_AGENTS[0]},
+                                timeout=(CONNECT_TIMEOUT, TIMEOUT))
+        tracks_r.raise_for_status()
+        tree = tracks_r.json()
+
+        # 3. 递归遍历，收集音频/视频/字幕
+        def walk(nodes, prefix=""):
+            if isinstance(nodes, list):
+                for n in nodes:
+                    walk(n, prefix)
+            elif isinstance(nodes, dict):
+                t = nodes.get("type", "")
+                title = nodes.get("title", "unknown")
+                path = (prefix + "/" + title) if prefix else title
+
+                if t == "audio":
+                    dl_url = nodes.get("mediaDownloadUrl", "")
+                    stream_url = nodes.get("mediaStreamUrl", "")
+                    media_url = dl_url or stream_url
+                    if not media_url:
+                        _log.warning(f"[asmr.one] 无下载链接: {title}")
+                        return
+                    rtype = "音频"
+                    resources.append(Resource(url=media_url, rtype=rtype, name=path, source=url))
+
+                elif t == "text":
+                    # VTT 字幕作为单独资源
+                    sub_url = nodes.get("mediaDownloadUrl", "")
+                    if sub_url and title:
+                        resources.append(Resource(url=sub_url, rtype="字幕",
+                                                  name=path, source=url))
+
+                elif t == "folder":
+                    # 使用 folder 的 title，而非继承 name
+                    folder_name = nodes.get("title", "")
+                    current_path = (prefix + "/" + folder_name) if prefix else folder_name
+                    for child in nodes.get("children", []):
+                        walk(child, current_path)
+
+        walk(tree)
+        _log.info(f"[asmr.one] {rj} → {len(resources)} 个资源")
+
+    except Exception as e:
+        _log.error(f"[asmr.one] 抓取失败 {rj}: {e}")
+
+    return resources
     return result
