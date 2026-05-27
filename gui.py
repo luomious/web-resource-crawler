@@ -13,7 +13,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from core.scraper import fetch_html, parse_resources
+from core.scraper import fetch_html, parse_resources, Resource
 from core.downloader import download_all
 
 import os as _os
@@ -41,19 +41,75 @@ def _save_history(urls):
 
 class FetchWorker(QThread):
     finished = pyqtSignal(str, list)
+
+    # asmr.one API 内嵌（无需依赖 scraper 模块）
+    ASMR_RJ = re.compile(r'asmr\.one/work/(RJ\d+)', re.I)
+    ASMR_API_INFO = "https://api.asmr.one/api/workInfo/{}"
+    ASMR_API_TRACKS = "https://api.asmr.one/api/tracks/{}"
+
     def __init__(self, urls):
         super().__init__(); self.urls = urls
+
     def run(self):
         all_resources = []
         for url in self.urls:
             try:
-                html = fetch_html(url)
-                res = parse_resources(html, url, source_url=url)
+                # 检测 asmr.one 并直接调用 API
+                m = self.ASMR_RJ.search(url)
+                if m:
+                    res = self._fetch_asmr_one(url, m.group(1))
+                else:
+                    html = fetch_html(url)
+                    res = parse_resources(html, url, source_url=url)
                 all_resources.extend(res)
-            except Exception as e:
+            except Exception:
                 pass
         label = self.urls[0] if len(self.urls)==1 else f"{len(self.urls)}个网页"
         self.finished.emit(label, all_resources)
+
+    def _fetch_asmr_one(self, url, rj):
+        """直接调用 asmr.one API，不依赖 scraper"""
+        import requests as req
+        resources = []
+        try:
+            # 1. 获取作品 ID
+            info = req.get(self.ASMR_API_INFO.format(rj),
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=(10, 30))
+            info.raise_for_status()
+            work_id = info.json().get("id")
+            if not work_id:
+                return resources
+
+            # 2. 获取文件树
+            tracks = req.get(self.ASMR_API_TRACKS.format(work_id),
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=(10, 30))
+            tracks.raise_for_status()
+            tree = tracks.json()
+
+            # 3. 递归提取
+            def walk(nodes, prefix=""):
+                if isinstance(nodes, list):
+                    for n in nodes: walk(n, prefix)
+                elif isinstance(nodes, dict):
+                    t = nodes.get("type", "")
+                    title = nodes.get("title", "?")
+                    path = (prefix + "/" + title) if prefix else title
+                    if t == "audio":
+                        dl = nodes.get("mediaDownloadUrl", "") or nodes.get("mediaStreamUrl", "")
+                        if dl:
+                            resources.append(Resource(url=dl, rtype="音频", name=path, source=url))
+                    elif t == "text":
+                        dl = nodes.get("mediaDownloadUrl", "")
+                        if dl and title:
+                            resources.append(Resource(url=dl, rtype="字幕", name=path, source=url))
+                    elif t == "folder":
+                        for c in nodes.get("children", []):
+                            walk(c, path)
+
+            walk(tree)
+        except Exception:
+            pass
+        return resources
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(int, int, str, int)
