@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 PORT = 18777
-SAVE_DIR = pathlib.Path("E:/downloads")
+SAVE_DIR = pathlib.Path("E:/VSCode/VSCode-Workspace/Web Resource Crawler/downloads")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 核心模块
