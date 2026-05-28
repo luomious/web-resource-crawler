@@ -1,5 +1,10 @@
+# Web Resource Crawler — 生产依赖
+# 核心运行时依赖（不含 deep-translator，翻译改用 requests + MyMemory API）
 requests>=2.28
 beautifulsoup4>=4.12
 lxml>=4.9
-deep-translator>=1.11
-mutagen>=1.47
+PyQt5>=5.15
+
+# 开发依赖（可选）
+# pytest>=7.0
+# pytest-cov>=4.0

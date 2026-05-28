@@ -1,429 +1,793 @@
 """
-网页资源爬虫 — PyQt5 中文版
+Web Resource Crawler — PyQt5 图形界面（View 层 + 轻量 Controller）。
+
+架构说明：
+    core/controller.py  — 纯业务逻辑（URL 规范、批量抓取、结果分类）
+    本文件（gui.py）     — View + Qt 线程桥接（FetchWorker / DownloadWorker / MainWindow）
+    core/scraper.py      — Facade → parser / fetcher / asmr_one / translator 等
+    core/downloader.py   — 下载引擎
+    core/config.py       — 配置持久化
+
+遵循 MVC/MVP 模式：MainWindow 专心做 View，controller.py 处理纯逻辑。
 """
-import sys, json, pathlib, re, threading
-from typing import List, Optional
+
+import sys
+import json
+import re
+import threading
+import logging
+from pathlib import Path
+from typing import Optional, List, Tuple, Any, Dict
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QListWidget,
-    QListWidgetItem, QFrame, QMessageBox, QFileDialog, QTextEdit
+    QListWidgetItem, QFrame, QMessageBox, QFileDialog, QTextEdit,
+    QTreeWidget, QTreeWidgetItem, QHeaderView,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QPalette, QColor
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
+# 核心模块导入
+sys.path.insert(0, str(Path(__file__).parent))
 from core.scraper import fetch_html, parse_resources, Resource
 from core.downloader import download_all
+from core.config import (
+    get_config_int,
+    load_config,
+    save_config,
+    load_history,
+    save_history,
+)
+from core.constants import (
+    HLS_DOWNLOAD_WORKERS,
+    HLS_DOWNLOAD_WORKER_LIMIT,
+    MAX_DOWNLOAD_WORKERS,
+)
+from core.controller import normalize_urls, fetch_resources, get_label_for_urls
 
-import os as _os
-_appdata = pathlib.Path(_os.environ.get("APPDATA", pathlib.Path.home() / "AppData" / "Roaming"))
-_config_dir = _appdata / "WebScraper"
-_config_dir.mkdir(parents=True, exist_ok=True)
-CONFIG_FILE = _config_dir / "config.json"
+_log = logging.getLogger("gui")
 
-def _load_config():
-    try:
-        if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except: pass
-    return {}
+# ──────────────────────────────────────────────────────────────────
+#  Worker 线程（Qt 桥接层 — 连接 core 模块和 UI）
+# ──────────────────────────────────────────────────────────────────
 
-def _save_config(cfg):
-    try: CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    except: pass
-
-def _load_history():
-    return _load_config().get("history", [])
-
-def _save_history(urls):
-    cfg = _load_config(); cfg["history"] = urls[:50]; _save_config(cfg)
 
 class FetchWorker(QThread):
+    """抓取工作线程。
+
+    在后台线程中依次抓取多个 URL，通过 finished 信号将结果传回 UI 线程。
+    asmr.one 的解析由 scraper 模块内部自动路由，本 Worker 无需特殊处理。
+
+    Signals:
+        finished(str, list[Resource]): (显示标签, 去重资源列表)
+    """
     finished = pyqtSignal(str, list)
 
-    # asmr.one API 内嵌（无需依赖 scraper 模块）
-    ASMR_RJ = re.compile(r'asmr\.one/work/(RJ\d+)', re.I)
-    ASMR_API_INFO = "https://api.asmr.one/api/workInfo/{}"
-    ASMR_API_TRACKS = "https://api.asmr.one/api/tracks/{}"
+    def __init__(self, urls: List[str]) -> None:
+        """初始化抓取线程。
 
-    def __init__(self, urls):
-        super().__init__(); self.urls = urls
+        Args:
+            urls: 规范化后的 URL 列表。
+        """
+        super().__init__()
+        self._urls: List[str] = urls
 
-    def run(self):
-        all_resources = []
-        for url in self.urls:
-            try:
-                # 检测 asmr.one 并直接调用 API
-                m = self.ASMR_RJ.search(url)
-                if m:
-                    res = self._fetch_asmr_one(url, m.group(1))
-                else:
-                    html = fetch_html(url)
-                    res = parse_resources(html, url, source_url=url)
-                all_resources.extend(res)
-            except Exception:
-                pass
-        label = self.urls[0] if len(self.urls)==1 else f"{len(self.urls)}个网页"
+    def run(self) -> None:
+        """执行抓取（在后台线程中运行，禁止直接操作 UI）。"""
+        all_resources = fetch_resources(self._urls)
+        label = get_label_for_urls(self._urls)
         self.finished.emit(label, all_resources)
 
-    def _fetch_asmr_one(self, url, rj):
-        """直接调用 asmr.one API，不依赖 scraper"""
-        import requests as req
-        resources = []
-        try:
-            # 1. 获取作品 ID
-            info = req.get(self.ASMR_API_INFO.format(rj),
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=(10, 30))
-            info.raise_for_status()
-            work_id = info.json().get("id")
-            if not work_id:
-                return resources
-
-            # 2. 获取文件树
-            tracks = req.get(self.ASMR_API_TRACKS.format(work_id),
-                           headers={"User-Agent": "Mozilla/5.0"}, timeout=(10, 30))
-            tracks.raise_for_status()
-            tree = tracks.json()
-
-            # 3. 递归提取
-            def walk(nodes, prefix=""):
-                if isinstance(nodes, list):
-                    for n in nodes: walk(n, prefix)
-                elif isinstance(nodes, dict):
-                    t = nodes.get("type", "")
-                    title = nodes.get("title", "?")
-                    path = (prefix + "/" + title) if prefix else title
-                    if t == "audio":
-                        dl = nodes.get("mediaDownloadUrl", "") or nodes.get("mediaStreamUrl", "")
-                        if dl:
-                            resources.append(Resource(url=dl, rtype="音频", name=path, source=url))
-                    elif t == "text":
-                        dl = nodes.get("mediaDownloadUrl", "")
-                        if dl and title:
-                            resources.append(Resource(url=dl, rtype="字幕", name=path, source=url))
-                    elif t == "folder":
-                        for c in nodes.get("children", []):
-                            walk(c, path)
-
-            walk(tree)
-        except Exception:
-            pass
-        return resources
 
 class DownloadWorker(QThread):
+    """下载工作线程。
+
+    将 Resource 列表交给 downloader 批量下载，通过 progress 信号推送进度，
+    finished 信号返回分类后的结果。
+
+    Signals:
+        progress(int, int, str, int): (total, done, 文件名, 百分比)
+        finished(list, list, list): (ok_list, fail_list, stop_list)
+    """
     progress = pyqtSignal(int, int, str, int)
     finished = pyqtSignal(list, list, list)
-    def __init__(self, rlist, savedir, stopflag):
-        super().__init__(); self.rlist = rlist; self.savedir = savedir
-        self.stopflag = stopflag; self._c = 0
-    def run(self):
-        def cb(t, d, n):
-            p = min(int(d/t*100), 100) if t else 0
-            self._c += 1
-            if self._c % 15 == 0 or "OK" in n or "Done" in n:
-                self.progress.emit(t, d, n, p)
+
+    def __init__(
+        self,
+        resources: List[Resource],
+        save_dir: Path,
+        stop_flag: threading.Event,
+        max_workers: int,
+        hls_max_workers: int,
+    ) -> None:
+        """初始化下载线程。
+
+        Args:
+            resources: 待下载的 Resource 对象列表。
+            save_dir: 保存目录。
+            stop_flag: 停止信号（来自 UI 的 threading.Event）。
+            max_workers: 批量下载并发数。
+            hls_max_workers: HLS 分片并发数。
+        """
+        super().__init__()
+        self._resources: List[Resource] = resources
+        self._save_dir: Path = save_dir
+        self._stop_flag: threading.Event = stop_flag
+        self._max_workers: int = max_workers
+        self._hls_max_workers: int = hls_max_workers
+        self._progress_count: int = 0
+
+    def run(self) -> None:
+        """执行下载（在后台线程中运行）。"""
+        def progress_cb(total: int, done: int, name: str) -> None:
+            """下载进度回调（线程安全）。"""
+            pct: int = min(int(done / total * 100), 100) if total else 0
+            self._progress_count += 1
+            # 节流：避免过于频繁的 UI 更新
+            if self._progress_count % 15 == 0 or "OK" in name or "Done" in name:
+                self.progress.emit(total, done, name, pct)
 
         try:
-            results = download_all(self.rlist, self.savedir, stop_flag=self.stopflag, progress_cb=cb)
+            results = download_all(
+                self._resources,
+                self._save_dir,
+                stop_flag=self._stop_flag,
+                progress_cb=progress_cb,
+                max_workers=self._max_workers,
+                hls_max_workers=self._hls_max_workers,
+            )
         except Exception as e:
-            self.finished.emit([], [(r.url, str(e)) for r in self.rlist], [])
+            failed = [(r.url, str(e)) for r in self._resources]
+            self.finished.emit([], failed, [])
             return
 
-        ok, fail, stop = [], [], []
-        for u, p in results:
-            if p == "__STOPPED__":
-                stop.append((u, p))
-            elif p and pathlib.Path(p).exists():
-                try:
-                    sz = pathlib.Path(p).stat().st_size
-                    ok.append((u, p, sz))
-                except:
-                    ok.append((u, p, 0))
-            else:
-                fail.append((u, p or "下载失败"))
-        self.finished.emit(ok, fail, stop)
+        # 分类结果（交由 controller 层处理）
+        from core.controller import classify_download_results, STOPPED_MARKER
+        ok_list, fail_list, stop_list = classify_download_results(results)
+        self.finished.emit(ok_list, fail_list, stop_list)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  主窗口（View）
+# ──────────────────────────────────────────────────────────────────
+
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    """Web Resource Crawler 主窗口。
+
+    负责：
+        - UI 组件构建与布局
+        - 主题切换
+        - 用户交互事件的响应（创建 Worker、更新 UI 状态）
+    """
+
+    # 暗色主题样式表（VS Code 风格）
+    _DARK_STYLE: str = """
+        QMainWindow, QWidget { background: #2b2b2b; color: #d4d4d4; }
+        QFrame { background: #353535; border: 1px solid #505050; border-radius: 4px; }
+        QPushButton { background: #3c3c3c; color: #d4d4d4; border: 1px solid #505050;
+                      border-radius: 4px; padding: 4px 12px; }
+        QPushButton:hover { background: #4a4a4a; }
+        QLineEdit { background: #3c3c3c; color: #d4d4d4; border: 1px solid #505050;
+                    border-radius: 4px; padding: 4px 8px; }
+        QTreeWidget, QListWidget, QTextEdit { background: #3c3c3c; color: #d4d4d4;
+                                              border: 1px solid #505050; border-radius: 4px; }
+        QTreeWidget::item:selected { background: #094771; }
+        QTreeWidget::item:hover { background: #2a2d2e; }
+        QHeaderView::section { background: #353535; color: #d4d4d4;
+                               border: 1px solid #505050; padding: 4px; }
+        QProgressBar { background: #3c3c3c; border: 1px solid #505050;
+                       border-radius: 4px; text-align: center; }
+        QProgressBar::chunk { background: #569cd6; border-radius: 3px; }
+        QLabel { color: #d4d4d4; }
+    """
+
+    def __init__(self) -> None:
+        """初始化主窗口，加载配置、构建 UI、应用主题。"""
         super().__init__()
         self.setWindowTitle("网页资源爬虫")
         self.setGeometry(100, 100, 1200, 800)
 
-        cfg = _load_config()
-        self.resources = []
-        self.downloading = False
-        self.stop_flag = threading.Event()
-        self.history = _load_history()
-        self.save_dir = pathlib.Path(cfg.get("save_dir", "E:/"))
+        # 加载配置
+        cfg: dict = load_config()
 
-        self._fetch_w = None
-        self._dl_w = None
-        self._dl_log = []
+        # 状态变量
+        self.resources: List[Resource] = []
+        self._downloading: bool = False
+        self._stop_flag: threading.Event = threading.Event()
+        self._history: List[str] = load_history()
+        self._save_dir: Path = Path(cfg.get("save_dir", "E:/"))
+        self._max_workers: int = get_config_int(
+            cfg, "max_workers", MAX_DOWNLOAD_WORKERS, 1, HLS_DOWNLOAD_WORKER_LIMIT,
+        )
+        self._hls_max_workers: int = get_config_int(
+            cfg, "hls_workers", HLS_DOWNLOAD_WORKERS, 1, HLS_DOWNLOAD_WORKER_LIMIT,
+        )
 
+        # Worker 引用
+        self._fetch_worker: Optional[FetchWorker] = None
+        self._dl_worker: Optional[DownloadWorker] = None
+
+        # 下载管理中的条目映射
+        self._dl_items: dict[str, QListWidgetItem] = {}
+        self._global_item: Optional[QListWidgetItem] = None
+
+        # 资源树中叶子节点 → Resource 的映射（用于快速查找）
+        self._leaf_to_resource: Dict[int, Resource] = {}
+
+        # 当前筛选类型
+        self._current_filter: Optional[str] = None
+
+        # 构建 UI
         self._build_ui()
+        self._apply_theme(cfg.get("theme", "light") or "light")
 
-    def _build_ui(self):
-        c = QWidget()
-        self.setCentralWidget(c)
-        lo = QVBoxLayout(c)
-        lo.setSpacing(6)
-        lo.setContentsMargins(10, 10, 10, 10)
+    # ── 主题 ──────────────────────────────────────────────────
 
-        # 标题
-        t = QLabel("🌐  网页资源爬虫")
-        t.setFont(QFont("Microsoft YaHei", 14))
-        lo.addWidget(t)
+    def _toggle_theme(self) -> None:
+        """切换暗色/亮色主题并持久化配置。"""
+        current: str = getattr(self, "_theme", "light")
+        new: str = "dark" if current == "light" else "light"
+        self._apply_theme(new)
 
-        # URL 输入区
-        uf = QFrame(); uf.setFrameStyle(QFrame.StyledPanel)
-        ul = QVBoxLayout(uf)
-        ul.addWidget(QLabel("网址 URL（多个用逗号或换行分隔）:"))
+        cfg: dict = load_config()
+        cfg["theme"] = new
+        save_config(cfg)
 
-        ir = QHBoxLayout()
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("https://example.com")
-        self.url_input.returnPressed.connect(self._fetch)
-        ir.addWidget(self.url_input)
+    def _apply_theme(self, theme: str) -> None:
+        """应用指定主题。
 
-        fb = QPushButton("🔍  抓 取")
-        fb.setMinimumWidth(100)
-        fb.clicked.connect(self._fetch)
-        ir.addWidget(fb)
-        ul.addLayout(ir)
+        Args:
+            theme: 'dark' 或 'light'。
+        """
+        self._theme = theme
+        if theme == "dark":
+            self.setStyleSheet(self._DARK_STYLE)
+            p: QPalette = self.palette()
+            p.setColor(QPalette.Window, QColor(43, 43, 43))
+            p.setColor(QPalette.WindowText, QColor(212, 212, 212))
+            p.setColor(QPalette.Base, QColor(60, 60, 60))
+            p.setColor(QPalette.Text, QColor(212, 212, 212))
+            p.setColor(QPalette.Button, QColor(60, 60, 60))
+            p.setColor(QPalette.ButtonText, QColor(212, 212, 212))
+            p.setColor(QPalette.Highlight, QColor(86, 156, 214))
+            self.setPalette(p)
+            self._theme_btn.setText("\u2600\ufe0f 亮色")  # ☀️ 亮色
+        else:
+            self.setStyleSheet("")
+            self.setPalette(QApplication.style().standardPalette())
+            self._theme_btn.setText("\U0001f319 暗色")  # 🌙 暗色
 
-        pr = QHBoxLayout()
-        pr.addWidget(QLabel(f"保存目录: {self.save_dir}"))
-        ch = QPushButton("📁 更换")
-        ch.clicked.connect(self._change_dir)
-        pr.addWidget(ch)
-        pr.addStretch()
-        ul.addLayout(pr)
+    # ── UI 构建 ──────────────────────────────────────────────
 
-        lo.addWidget(uf)
+    def _build_ui(self) -> None:
+        """构建完整的 UI 布局（标题栏、URL 输入区、三栏主内容、状态栏）。"""
+        central: QWidget = QWidget()
+        self.setCentralWidget(central)
+        root_layout: QVBoxLayout = QVBoxLayout(central)
+        root_layout.setSpacing(6)
+        root_layout.setContentsMargins(10, 10, 10, 10)
 
-        # 主内容区
-        ct = QHBoxLayout()
+        # ── 标题栏（含主题切换）──
+        title_layout: QHBoxLayout = QHBoxLayout()
+        title_label: QLabel = QLabel("\U0001f310  网页资源爬虫")
+        title_label.setFont(QFont("Microsoft YaHei", 14))
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+
+        self._theme_btn: QPushButton = QPushButton("\U0001f319 暗色")
+        self._theme_btn.setFixedWidth(80)
+        self._theme_btn.clicked.connect(self._toggle_theme)
+        title_layout.addWidget(self._theme_btn)
+        root_layout.addLayout(title_layout)
+
+        # ── URL 输入区 ──
+        url_frame: QFrame = QFrame()
+        url_frame.setFrameStyle(QFrame.StyledPanel)
+        url_layout: QVBoxLayout = QVBoxLayout(url_frame)
+        url_layout.addWidget(QLabel("网址 URL（多个用逗号或换行分隔）:"))
+
+        input_row: QHBoxLayout = QHBoxLayout()
+        self._url_input: QLineEdit = QLineEdit()
+        self._url_input.setPlaceholderText("https://example.com")
+        self._url_input.returnPressed.connect(self._on_fetch)
+        input_row.addWidget(self._url_input)
+
+        fetch_btn: QPushButton = QPushButton("\U0001f50d  抓 取")
+        fetch_btn.setMinimumWidth(100)
+        fetch_btn.clicked.connect(self._on_fetch)
+        input_row.addWidget(fetch_btn)
+        url_layout.addLayout(input_row)
+
+        dir_row: QHBoxLayout = QHBoxLayout()
+        dir_row.addWidget(QLabel(f"保存目录: {self._save_dir}"))
+        change_dir_btn: QPushButton = QPushButton("\U0001f4c1 更换")
+        change_dir_btn.clicked.connect(self._on_change_dir)
+        dir_row.addWidget(change_dir_btn)
+        dir_row.addStretch()
+        url_layout.addLayout(dir_row)
+        root_layout.addWidget(url_frame)
+
+        # ── 三栏主内容区 ──
+        content_layout: QHBoxLayout = QHBoxLayout()
 
         # 左侧：下载管理
-        lt = QVBoxLayout()
-        lt.addWidget(QLabel("📥 下载管理"))
-        self.dl_list = QListWidget()
-        lt.addWidget(self.dl_list)
-        ct.addLayout(lt, 1)
+        left_layout: QVBoxLayout = QVBoxLayout()
+        left_layout.addWidget(QLabel("\U0001f4e5 下载管理"))
+        self._dl_list: QListWidget = QListWidget()
+        left_layout.addWidget(self._dl_list)
+        content_layout.addLayout(left_layout, 1)
 
-        # 中间：资源列表
-        md = QVBoxLayout()
+        # 中间：资源树
+        mid_layout: QVBoxLayout = QVBoxLayout()
 
-        ft = QHBoxLayout()
-        ft.addWidget(QLabel("筛选:"))
-        self.fb_all = QPushButton("全部")
-        self.fb_all.clicked.connect(lambda: self._filter(None))
-        ft.addWidget(self.fb_all)
-        ft.addStretch()
-        md.addLayout(ft)
+        filter_row: QHBoxLayout = QHBoxLayout()
+        filter_row.addWidget(QLabel("筛选:"))
+        self._filter_all_btn: QPushButton = QPushButton("全部")
+        self._filter_all_btn.clicked.connect(lambda: self._on_filter(None))
+        filter_row.addWidget(self._filter_all_btn)
+        filter_row.addStretch()
+        mid_layout.addLayout(filter_row)
 
-        self.res_list = QListWidget()
-        self.res_list.itemClicked.connect(self._preview)
-        md.addWidget(self.res_list)
+        self._res_tree: QTreeWidget = QTreeWidget()
+        self._res_tree.setHeaderLabels(["名称", "类型"])
+        self._res_tree.header().setStretchLastSection(False)
+        self._res_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._res_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._res_tree.setColumnWidth(1, 80)
+        self._res_tree.itemClicked.connect(self._on_preview)
+        self._res_tree.itemChanged.connect(self._on_item_changed)
+        mid_layout.addWidget(self._res_tree)
 
-        cr = QHBoxLayout()
-        cr.addWidget(QPushButton("☑ 全选", clicked=self._sel_all))
-        cr.addWidget(QPushButton("☐ 取消", clicked=self._sel_none))
-        self.cnt_label = QLabel("已选 0 项")
-        cr.addWidget(self.cnt_label)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        cr.addWidget(self.progress)
-        db = QPushButton("⬇  下 载")
-        db.setMinimumWidth(100)
-        db.clicked.connect(self._download)
-        cr.addWidget(db)
+        action_row: QHBoxLayout = QHBoxLayout()
+        action_row.addWidget(QPushButton("\u2611 全选", clicked=self._on_select_all))
+        action_row.addWidget(QPushButton("\u2610 取消", clicked=self._on_select_none))
+        self._count_label: QLabel = QLabel("已选 0 项")
+        action_row.addWidget(self._count_label)
 
-        self.stop_btn = QPushButton("⏹ 停止")
-        self.stop_btn.clicked.connect(self._stop_dl)
-        cr.addWidget(self.stop_btn)
+        self._progress: QProgressBar = QProgressBar()
+        self._progress.setRange(0, 100)
+        action_row.addWidget(self._progress)
 
-        md.addLayout(cr)
-        ct.addLayout(md, 3)
+        dl_btn: QPushButton = QPushButton("\u2b07  下 载")
+        dl_btn.setMinimumWidth(100)
+        dl_btn.clicked.connect(self._on_download)
+        action_row.addWidget(dl_btn)
+
+        self._stop_btn: QPushButton = QPushButton("\u23f9 停止")
+        self._stop_btn.clicked.connect(self._on_stop_download)
+        action_row.addWidget(self._stop_btn)
+        mid_layout.addLayout(action_row)
+        content_layout.addLayout(mid_layout, 3)
 
         # 右侧：预览
-        rt = QVBoxLayout()
-        rt.addWidget(QLabel("📖 资源预览"))
-        self.pv = QTextEdit()
-        self.pv.setReadOnly(True)
-        self.pv.setMinimumWidth(250)
-        rt.addWidget(self.pv)
-        ct.addLayout(rt, 1)
+        right_layout: QVBoxLayout = QVBoxLayout()
+        right_layout.addWidget(QLabel("\U0001f4d6 资源预览"))
+        self._preview_area: QTextEdit = QTextEdit()
+        self._preview_area.setReadOnly(True)
+        self._preview_area.setMinimumWidth(250)
+        right_layout.addWidget(self._preview_area)
+        content_layout.addLayout(right_layout, 1)
 
-        lo.addLayout(ct, 1)
+        root_layout.addLayout(content_layout, 1)
 
-        # 状态栏
-        self.st = QLabel("就绪")
-        lo.addWidget(self.st)
+        # ── 状态栏 ──
+        self._status_label: QLabel = QLabel("就绪")
+        root_layout.addWidget(self._status_label)
 
-    def _fetch(self):
-        """抓取 - 每次创建新线程，无状态阻拦"""
-        raw = self.url_input.text().strip()
+    # ── 资源树构建 ───────────────────────────────────────────
+
+    def _build_resource_tree(self, resources: List[Resource]) -> None:
+        """将 Resource 列表按路径分组构建为树形结构。
+
+        asmr.one 资源的 name 格式为「文件夹/子文件夹/文件名」，
+        按 '/' 拆分后逐层创建树节点。普通网页资源的 name 无路径分隔符，
+        直接挂在根节点下。
+
+        Args:
+            resources: 抓取到的资源列表。
+        """
+        self._res_tree.blockSignals(True)
+        self._res_tree.clear()
+        self._leaf_to_resource.clear()
+
+        # 按路径前缀分组：路径 → {子路径 → ... 或 Resource}
+        # 使用 dict 逐层建树
+        folder_nodes: Dict[str, QTreeWidgetItem] = {}  # path_str → node
+
+        for r in resources:
+            # 筛选过滤
+            if self._current_filter is not None and r.rtype != self._current_filter:
+                continue
+
+            parts = r.name.split("/")
+            if len(parts) == 1:
+                # 无路径 — 直接挂根节点
+                leaf = QTreeWidgetItem(self._res_tree, [r.name, r.rtype])
+                leaf.setData(0, Qt.UserRole, r)
+                leaf.setCheckState(0, Qt.Unchecked)
+                # 存储叶子节点 id → Resource 映射
+                self._leaf_to_resource[id(leaf)] = r
+            else:
+                # 有路径 — 逐层创建文件夹节点
+                parent: QTreeWidgetItem = self._res_tree.invisibleRootItem()
+                path_so_far: str = ""
+                for i, part in enumerate(parts[:-1]):
+                    path_so_far = f"{path_so_far}/{part}" if path_so_far else part
+                    if path_so_far in folder_nodes:
+                        parent = folder_nodes[path_so_far]
+                    else:
+                        folder_item = QTreeWidgetItem(parent, [f"📁 {part}", ""])
+                        folder_item.setData(0, Qt.UserRole, None)  # 文件夹无 Resource
+                        folder_item.setCheckState(0, Qt.Unchecked)
+                        folder_item.setExpanded(True)
+                        folder_nodes[path_so_far] = folder_item
+                        parent = folder_item
+
+                # 叶子节点（文件名 = parts[-1]）
+                leaf = QTreeWidgetItem(parent, [parts[-1], r.rtype])
+                leaf.setData(0, Qt.UserRole, r)
+                leaf.setCheckState(0, Qt.Unchecked)
+                self._leaf_to_resource[id(leaf)] = r
+
+        self._res_tree.blockSignals(False)
+        self._update_count()
+
+    # ── 抓取流程 ─────────────────────────────────────────────
+
+    def _on_fetch(self) -> None:
+        """点击「抓取」按钮：规范化 URL → 更新历史 → 启动 FetchWorker。"""
+        raw: str = self._url_input.text().strip()
         if not raw:
             return
 
-        urls = [u.strip() for u in re.split(r'[,\n]+', raw) if u.strip()]
+        urls: List[str] = normalize_urls(raw)
         if not urls:
             return
 
-        norm = [u if u.startswith(("http://", "https://")) else "https://" + u for u in urls]
+        # 更新历史
+        if urls[0] not in self._history:
+            self._history.insert(0, urls[0])
+            self._history = self._history[:50]
+            save_history(self._history)
 
-        if norm[0] not in self.history:
-            self.history.insert(0, norm[0])
-            if len(self.history) > 50:
-                self.history = self.history[:50]
-            _save_history(self.history)
+        # 清空上一轮结果
+        self._res_tree.clear()
+        self._leaf_to_resource.clear()
+        self._preview_area.clear()
+        self._status_label.setText(f"\u23f3 正在抓取 {len(urls)} 个网页...")
 
-        self.res_list.clear()
-        self.pv.clear()
-        self.st.setText(f"⏳ 正在抓取 {len(norm)} 个网页...")
+        # 启动抓取线程
+        self._fetch_worker = FetchWorker(urls)
+        self._fetch_worker.finished.connect(self._on_fetch_done)
+        self._fetch_worker.start()
 
-        self._fetch_w = FetchWorker(norm)
-        self._fetch_w.finished.connect(self._on_fetch_done)
-        self._fetch_w.start()
-
-    def _on_fetch_done(self, label, resources):
+    def _on_fetch_done(self, label: str, resources: List[Resource]) -> None:
+        """FetchWorker 完成回调：构建资源树。"""
         self.resources = resources
-        self.st.setText(f"✅ 找到 {len(resources)} 个资源")
+        self._current_filter = None
+        self._status_label.setText(f"\u2705 找到 {len(resources)} 个资源")
 
-        for r in resources:
-            txt = f"[{r.rtype}] {r.name}"
-            it = QListWidgetItem(txt)
-            it.setData(Qt.UserRole, r)
-            it.setCheckState(Qt.Unchecked)  # 默认不勾选
-            self.res_list.addItem(it)
+        self._build_resource_tree(resources)
 
-        self._upd_cnt()
+    # ── 资源树交互 ───────────────────────────────────────────
 
-    def _filter(self, ftype):
-        self.res_list.clear()
-        for r in self.resources:
-            if ftype is None or r.rtype == ftype:
-                it = QListWidgetItem(f"[{r.rtype}] {r.name}")
-                it.setData(Qt.UserRole, r)
-                it.setCheckState(Qt.Unchecked)  # 过滤后也不勾选
-                self.res_list.addItem(it)
-        self._upd_cnt()
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        """树节点勾选状态变化时：级联父子节点。
 
-    def _sel_all(self):
-        for i in range(self.res_list.count()):
-            self.res_list.item(i).setCheckState(Qt.Checked)
-        self._upd_cnt()
+        - 父节点勾选 → 所有子节点勾选
+        - 父节点取消 → 所有子节点取消
+        - 子节点变化 → 更新父节点状态（全选/部分/无）
 
-    def _sel_none(self):
-        for i in range(self.res_list.count()):
-            self.res_list.item(i).setCheckState(Qt.Unchecked)
-        self._upd_cnt()
+        Args:
+            item: 状态变化的树节点。
+            column: 变化的列（0 = 名称列含 checkbox）。
+        """
+        if column != 0:
+            return
 
-    def _upd_cnt(self):
-        n = sum(1 for i in range(self.res_list.count()) if self.res_list.item(i).checkState() == Qt.Checked)
-        self.cnt_label.setText(f"已选 {n} 项")
+        self._res_tree.blockSignals(True)
 
-    def _preview(self, item):
-        r = item.data(Qt.UserRole)
-        self.pv.setHtml(f"""
+        check_state = item.checkState(0)
+
+        # 级联到子节点
+        for i in range(item.childCount()):
+            item.child(i).setCheckState(0, check_state)
+
+        # 更新父节点状态
+        self._update_parent_check(item)
+
+        self._res_tree.blockSignals(False)
+        self._update_count()
+
+    def _update_parent_check(self, item: QTreeWidgetItem) -> None:
+        """根据子节点勾选状态更新父节点的 checkState。
+
+        规则：所有子节点勾选 → 父勾选；所有取消 → 父取消；否则部分勾选（显示为未选）。
+
+        Args:
+            item: 需要向上更新父节点的子节点。
+        """
+        parent = item.parent()
+        if parent is None:
+            return
+
+        child_count = parent.childCount()
+        checked = sum(
+            1 for i in range(child_count)
+            if parent.child(i).checkState(0) == Qt.Checked
+        )
+
+        self._res_tree.blockSignals(True)
+        if checked == 0:
+            parent.setCheckState(0, Qt.Unchecked)
+        elif checked == child_count:
+            parent.setCheckState(0, Qt.Checked)
+        else:
+            parent.setCheckState(0, Qt.PartiallyChecked)
+        self._res_tree.blockSignals(False)
+
+        # 递归向上
+        self._update_parent_check(parent)
+
+    def _on_filter(self, rtype: Optional[str]) -> None:
+        """按资源类型筛选列表。
+
+        Args:
+            rtype: 类型字符串（如 '图片'）；None 表示显示全部。
+        """
+        self._current_filter = rtype
+        self._build_resource_tree(self.resources)
+
+    def _on_select_all(self) -> None:
+        """全选资源树中的所有叶子节点。"""
+        self._res_tree.blockSignals(True)
+        it = QTreeWidgetItemIterator(self._res_tree)
+        while it.value():
+            item = it.value()
+            if id(item) in self._leaf_to_resource:
+                item.setCheckState(0, Qt.Checked)
+            it.__next__()
+        # 更新所有文件夹节点状态
+        self._sync_all_folder_checks()
+        self._res_tree.blockSignals(False)
+        self._update_count()
+
+    def _on_select_none(self) -> None:
+        """取消全选。"""
+        self._res_tree.blockSignals(True)
+        it = QTreeWidgetItemIterator(self._res_tree)
+        while it.value():
+            item = it.value()
+            item.setCheckState(0, Qt.Unchecked)
+            it.__next__()
+        self._res_tree.blockSignals(False)
+        self._update_count()
+
+    def _sync_all_folder_checks(self) -> None:
+        """同步所有文件夹节点的勾选状态（从叶子向上传播）。"""
+        # 收集所有叶子，然后逐层更新父节点
+        leaves: List[QTreeWidgetItem] = []
+        it = QTreeWidgetItemIterator(self._res_tree)
+        while it.value():
+            item = it.value()
+            if id(item) in self._leaf_to_resource:
+                leaves.append(item)
+            it.__next__()
+
+        # 从叶子向上递归更新
+        updated_parents: set = set()
+        for leaf in leaves:
+            parent = leaf.parent()
+            while parent is not None and id(parent) not in updated_parents:
+                self._update_parent_check(leaf)
+                updated_parents.add(id(parent))
+                parent = parent.parent()
+
+    def _update_count(self) -> None:
+        """更新「已选 N 项」标签。"""
+        checked: int = sum(
+            1 for item_id, r in self._leaf_to_resource.items()
+            # 需要从树中找到对应节点
+        )
+        # 遍历树统计勾选的叶子
+        checked = 0
+        it = QTreeWidgetItemIterator(self._res_tree)
+        while it.value():
+            item = it.value()
+            if id(item) in self._leaf_to_resource and item.checkState(0) == Qt.Checked:
+                checked += 1
+            it.__next__()
+        self._count_label.setText(f"已选 {checked} 项")
+
+    def _on_preview(self, item: QTreeWidgetItem, column: int) -> None:
+        """点击资源树项：右侧面板显示详细信息。
+
+        Args:
+            item: 被点击的 QTreeWidgetItem。
+            column: 点击的列号。
+        """
+        r: Optional[Resource] = item.data(0, Qt.UserRole)
+        if r is None:
+            # 文件夹节点 — 显示文件夹信息
+            name = item.text(0)
+            child_count = item.childCount()
+            self._preview_area.setHtml(f"""
+            <b>📁 文件夹</b><br><br>
+            <b>名称:</b> {name}<br><br>
+            <b>包含:</b> {child_count} 项<br>
+            """)
+            return
+
+        self._preview_area.setHtml(f"""
         <b>{r.rtype}</b><br><br>
         <b>文件名:</b> {r.name}<br><br>
         <b>URL:</b><br><small>{r.url}</small><br><br>
         <b>来源:</b> {getattr(r, 'source', '')}<br>
         """)
 
-    def _download(self):
-        checked = []
-        for i in range(self.res_list.count()):
-            item = self.res_list.item(i)
-            if item.checkState() == Qt.Checked:
-                checked.append(item.data(Qt.UserRole))
+    # ── 下载流程 ─────────────────────────────────────────────
+
+    def _get_checked_resources(self) -> List[Resource]:
+        """从资源树中收集所有勾选的叶子资源。
+
+        Returns:
+            勾选的 Resource 列表。
+        """
+        checked: List[Resource] = []
+        it = QTreeWidgetItemIterator(self._res_tree)
+        while it.value():
+            item = it.value()
+            if id(item) in self._leaf_to_resource and item.checkState(0) == Qt.Checked:
+                r = item.data(0, Qt.UserRole)
+                if r is not None:
+                    checked.append(r)
+            it.__next__()
+        return checked
+
+    def _on_download(self) -> None:
+        """点击「下载」按钮：收集勾选资源 → 启动 DownloadWorker。"""
+        checked = self._get_checked_resources()
 
         if not checked:
             QMessageBox.information(self, "提示", "请先勾选要下载的资源")
             return
 
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.downloading = True
-        self.stop_flag.clear()
-        self.st.setText("📻 开始下载...")
-        self.dl_list.clear()
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        self._downloading = True
+        self._stop_flag.clear()
+        self._status_label.setText("\U0001f4fb 开始下载...")
+        self._dl_list.clear()
 
-        # 每个资源一个下载条目
-        self._dl_items = {}  # name → listitem
+        # 构建下载条目列表（用 URL 作 key，避免文件名截取匹配不可靠）
+        self._dl_items = {}
+        self._dl_name_map = {}  # url → display name
         for r in checked:
-            item = QListWidgetItem(f"⬇ {r.name}")
-            self.dl_list.addItem(item)
-            self._dl_items[r.name] = item
+            item: QListWidgetItem = QListWidgetItem(f"\u2b07 {r.name}")
+            self._dl_list.addItem(item)
+            self._dl_items[r.url] = item
+            self._dl_name_map[r.url] = r.name
 
-        # 全局进度
-        self.dl_list.addItem("━━━━━━━━━━━━━━━━━")
+        # 总进度条目
+        self._dl_list.addItem("\u2501" * 15)
         self._global_item = QListWidgetItem("总进度: 0%")
-        self.dl_list.addItem(self._global_item)
+        self._dl_list.addItem(self._global_item)
 
-        self._dl_w = DownloadWorker(checked, self.save_dir, self.stop_flag)
-        self._dl_w.progress.connect(self._on_dl_progress)
-        self._dl_w.finished.connect(self._on_dl_done)
-        self._dl_w.start()
+        # 启动下载线程
+        self._dl_worker = DownloadWorker(
+            checked,
+            self._save_dir,
+            self._stop_flag,
+            self._max_workers,
+            self._hls_max_workers,
+        )
+        self._dl_worker.progress.connect(self._on_download_progress)
+        self._dl_worker.finished.connect(self._on_download_done)
+        self._dl_worker.start()
 
-    def _on_dl_progress(self, total, done, name, pct):
-        """下载进度: 实时刷新进度条和文件名"""
-        self.progress.setValue(pct)
+    def _on_download_progress(
+        self, total: int, done: int, name: str, pct: int
+    ) -> None:
+        """下载进度回调：更新进度条和文件条目文本。
 
-        # 找匹配的文件条目更新
-        matched = False
-        for key, item in list(self._dl_items.items()):
-            if key[:10] in name or name[:10] in key:
-                prefix = "✅" if pct >= 100 else "⬇"
-                item.setText(f"{prefix} {key[:30]} [{pct}%]")
+        使用 URL 精确匹配下载条目，替代之前的文件名截取匹配。
+
+        Args:
+            total: 资源总数。
+            done: 已完成数。
+            name: 当前下载中的文件名或进度信息。
+            pct: 完成百分比（0-100）。
+        """
+        self._progress.setValue(pct)
+
+        # 尝试通过 URL 精确匹配条目
+        matched: bool = False
+        for url, item in list(self._dl_items.items()):
+            display = self._dl_name_map.get(url, url)
+            # 进度回调的 name 包含文件名或 OK 信息，用 URL 片段匹配
+            if url in name or display[:20] in name or name[:20] in display:
+                prefix: str = "\u2705" if pct >= 100 else "\u2b07"
+                item.setText(f"{prefix} {display[:30]} [{pct}%]")
                 matched = True
                 break
 
-        if not matched and hasattr(self, '_dl_items'):
-            # 无匹配时更新第一个未完成的条目
-            for key, item in self._dl_items.items():
-                if "⬇" in item.text():
-                    item.setText(f"⬇ {key[:30]} [{pct}%]")
+        # fallback：更新第一个仍显示下载中的条目
+        if not matched and self._dl_items:
+            for url, item in self._dl_items.items():
+                if "\u2b07" in item.text():
+                    display = self._dl_name_map.get(url, url)
+                    item.setText(f"\u2b07 {display[:30]} [{pct}%]")
                     break
 
-        if hasattr(self, '_global_item'):
-            self._global_item.setText(f"总进度: [{done}/{total}] {name[:30]}")
-        self.st.setText(f"📥 [{done}/{total}] {name[:30]}")
+        if self._global_item is not None:
+            self._global_item.setText(
+                f"总进度: [{done}/{total}] {name[:30]}"
+            )
+        self._status_label.setText(f"\U0001f4e5 [{done}/{total}] {name[:30]}")
 
-    def _on_dl_done(self, ok, fail, stop):
-        self.downloading = False
-        self.progress.setValue(100)
+    def _on_download_done(
+        self,
+        ok_list: List[Tuple[str, str, int]],
+        fail_list: List[Tuple[str, str]],
+        stop_list: List[Tuple[str, str]],
+    ) -> None:
+        """下载完成回调：显示最终结果。
 
-        # 清空并显示最终结果
-        self.dl_list.clear()
-        for _, path, sz in ok:
-            fname = pathlib.Path(path).name
-            sz_str = f"{sz/1024/1024:.1f}MB" if sz > 1024*1024 else f"{sz/1024:.0f}KB"
-            self.dl_list.addItem(f"✅ {fname} ({sz_str})")
-        for _, err in fail:
-            self.dl_list.addItem(f"❌ {err[:60]}")
+        Args:
+            ok_list: [(url, path, filesize), ...] 成功条目。
+            fail_list: [(url, error), ...] 失败条目。
+            stop_list: [(url, marker), ...] 被停止的条目。
+        """
+        self._downloading = False
+        self._progress.setValue(100)
 
-        self.st.setText(f"✅ 完成: 成功 {len(ok)}, 失败 {len(fail)}")
-        QMessageBox.information(self, "下载结果", f"成功: {len(ok)} 项\n失败: {len(fail)} 项")
+        self._dl_list.clear()
+        for _, path, sz in ok_list:
+            fname: str = Path(path).name
+            if sz > 1024 * 1024:
+                sz_str: str = f"{sz / 1024 / 1024:.1f}MB"
+            else:
+                sz_str = f"{sz / 1024:.0f}KB"
+            self._dl_list.addItem(f"\u2705 {fname} ({sz_str})")
 
-    def _stop_dl(self):
-        self.stop_flag.set()
-        self.st.setText("⏹ 正在停止...")
+        for _, err in fail_list:
+            self._dl_list.addItem(f"\u274c {err[:60]}")
 
-    def _change_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择保存目录", str(self.save_dir))
-        if d:
-            self.save_dir = pathlib.Path(d)
-            cfg = _load_config()
-            cfg["save_dir"] = d
-            _save_config(cfg)
-            self.st.setText(f"保存目录: {d}")
+        self._status_label.setText(
+            f"\u2705 完成: 成功 {len(ok_list)}, 失败 {len(fail_list)}"
+        )
+
+        QMessageBox.information(
+            self, "下载结果",
+            f"成功: {len(ok_list)} 项\n失败: {len(fail_list)} 项",
+        )
+
+    def _on_stop_download(self) -> None:
+        """点击「停止」按钮：设置停止标志通知 Worker 中止。"""
+        self._stop_flag.set()
+        self._status_label.setText("\u23f9 正在停止...")
+
+    def _on_change_dir(self) -> None:
+        """点击「更换」按钮：选择新的保存目录。"""
+        directory: str = QFileDialog.getExistingDirectory(
+            self, "选择保存目录", str(self._save_dir),
+        )
+        if directory:
+            self._save_dir = Path(directory)
+            cfg: dict = load_config()
+            cfg["save_dir"] = directory
+            save_config(cfg)
+            self._status_label.setText(f"保存目录: {directory}")
+
+
+# ──────────────────────────────────────────────────────────────────
+#  入口
+# ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    app: QApplication = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
-    w = MainWindow()
-    w.show()
+    window: MainWindow = MainWindow()
+    window.show()
     sys.exit(app.exec_())
