@@ -49,7 +49,9 @@ _RETRY_TOTAL: int = 3
 
 
 def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> requests.Session:
-    """创建带 Retry 策略的 Session（连接池复用）。"""
+    """创建带 Retry 策略的 Session（连接池复用 + 代理）。"""
+    from core.config import get_proxy
+
     s = requests.Session()
     retry = Retry(
         total=_RETRY_TOTAL,
@@ -66,6 +68,12 @@ def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> request
     )
     s.mount('https://', adapter)
     s.mount('http://', adapter)
+
+    # 代理
+    proxies = get_proxy()
+    if proxies:
+        s.proxies.update(proxies)
+
     return s
 
 
@@ -156,6 +164,66 @@ def _merge_ts_segments(tmp_dir: Path, output_path: Path, total: int, stop_flag: 
                 if seg.exists():
                     with open(seg, 'rb') as sf:
                         shutil.copyfileobj(sf, out)
+
+
+def _ffmpeg_available() -> bool:
+    """检测系统是否安装了 ffmpeg。"""
+    import shutil as _shutil
+    return _shutil.which('ffmpeg') is not None
+
+
+def _remux_with_ffmpeg(
+    ts_path: Path,
+    output_path: Path,
+    stop_flag: Optional[threading.Event] = None,
+) -> bool:
+    """使用 ffmpeg 将 TS 转封装为 MP4/M4A。
+
+    不重新编码（-c copy），仅更换容器格式，速度极快。
+
+    Args:
+        ts_path: 源 TS 文件路径。
+        output_path: 目标 MP4/M4A 文件路径。
+        stop_flag: 停止信号。
+
+    Returns:
+        True 转封装成功，False 失败或 ffmpeg 不可用。
+    """
+    if not _ffmpeg_available():
+        return False
+
+    import subprocess
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(ts_path),
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            str(output_path),
+        ]
+        result = subprocess.run(
+            cmd,
+            timeout=120,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            # 转封装成功，删除原始 TS
+            ts_path.unlink(missing_ok=True)
+            return True
+        else:
+            _log.warning(f'[ffmpeg] 转封装失败: {result.stderr.decode("utf-8", errors="replace")[:200]}')
+            # 清理失败输出
+            output_path.unlink(missing_ok=True)
+            return False
+    except subprocess.TimeoutExpired:
+        _log.warning('[ffmpeg] 转封装超时')
+        output_path.unlink(missing_ok=True)
+        return False
+    except Exception as e:
+        _log.warning(f'[ffmpeg] 转封装异常: {e}')
+        output_path.unlink(missing_ok=True)
+        return False
 
 
 # ---- 普通文件下载 ------------------------------------------------
@@ -276,6 +344,7 @@ def download_hls(
     progress_cb: Optional[Callable] = None,
     max_workers: Optional[int] = None,
     session: Optional[requests.Session] = None,
+    is_audio: bool = False,
 ) -> tuple[str, str]:
     """下载 HLS 流并合并为单个 TS 文件。"""
     try:
@@ -393,9 +462,26 @@ def download_hls(
             return '', STOPPED_MARKER
 
         _cleanup_hls_tmp_dir(tmp_dir, total)
-        size_mb: float = output_path.stat().st_size / 1024 / 1024
-        _log.info(f'[HLS] 完成: {output_path} ({size_mb:.1f}MB)')
-        return str(output_path), ''
+
+        # 尝试 ffmpeg 转封装（TS → MP4/M4A）
+        final_path = output_path
+        if _ffmpeg_available():
+            ext = '.m4a' if is_audio else '.mp4'
+            remuxed = output_path.with_suffix(ext)
+            if progress_cb:
+                progress_cb(total, total, '转封装中...')
+            if _remux_with_ffmpeg(output_path, remuxed, stop_flag):
+                final_path = remuxed
+                size_mb = final_path.stat().st_size / 1024 / 1024
+                _log.info(f'[HLS] 转封装完成: {final_path} ({size_mb:.1f}MB)')
+            else:
+                size_mb = output_path.stat().st_size / 1024 / 1024
+                _log.info(f'[HLS] 转封装失败，保留 TS: {output_path} ({size_mb:.1f}MB)')
+        else:
+            size_mb = output_path.stat().st_size / 1024 / 1024
+            _log.info(f'[HLS] 完成: {output_path} ({size_mb:.1f}MB)')
+
+        return str(final_path), ''
 
     except Exception as e:
         _log.error(f'[HLS] 下载异常: {e}')
@@ -464,6 +550,7 @@ def download_all(
             stop_flag=stop_flag,
             max_workers=hls_max_workers,
             session=shared_session,
+            is_audio=(r.rtype == "\u97f3\u9891"),
         )
         if err == STOPPED_MARKER:
             results_dict[idx] = (r.url, STOPPED_MARKER)

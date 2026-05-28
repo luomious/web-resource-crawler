@@ -4,8 +4,13 @@
 将散落在 scraper.py / downloader.py 中的常量集中管理，避免魔法数字和重复定义。
 """
 
-# ── HTTP 请求 ──────────────────────────────────────────
 from typing import Final
+
+# ── 版本号 ─────────────────────────────────────────────
+APP_VERSION: Final[str] = "1.0.0"
+APP_NAME: Final[str] = "Web Resource Crawler"
+
+# ── HTTP 请求 ──────────────────────────────────────────
 
 USER_AGENTS: Final[list[str]] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",

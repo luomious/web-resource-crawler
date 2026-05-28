@@ -33,6 +33,7 @@ from core.asmr_one import is_asmr_one, parse_asmr_one
 from core.translator import translate_to_zh, translate_chapters
 from core.config import (
     get_config_int, load_config, save_config, load_history, save_history,
+    get_proxy,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     'is_asmr_one', 'parse_asmr_one', 'make_session',
     'translate_to_zh', 'translate_chapters',
     'get_config_int', 'load_config', 'save_config', 'load_history', 'save_history',
+    'get_proxy',
     'USER_AGENTS', 'IMG_EXTS', 'AUDIO_EXTS', 'VIDEO_EXTS',
     'DOC_EXTS', 'CSS_EXTS', 'JS_EXTS',
     'TIMEOUT', 'CONNECT_TIMEOUT', 'MAX_RETRIES',
@@ -48,5 +50,6 @@ __all__ = [
     'HLS_DOWNLOAD_WORKERS', 'HLS_DOWNLOAD_WORKER_LIMIT',
     'DOWNLOAD_TIMEOUT', 'DOWNLOAD_CONNECT_TIMEOUT',
     'DOWNLOAD_CHUNK_SIZE', 'DEFAULT_USER_AGENT', 'STOPPED_MARKER',
+    'APP_VERSION', 'APP_NAME',
     'ASMR_API_WORK_INFO', 'ASMR_API_TRACKS',
 ]

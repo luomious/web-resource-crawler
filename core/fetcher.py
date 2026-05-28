@@ -29,15 +29,13 @@ def make_session() -> requests.Session:
     """创建带重试策略和连接池复用的 Session。
 
     自动处理 5xx / 429 状态码的重试，指数退避（backoff_factor=1.0）。
+    自动读取代理配置。
 
     Returns:
-        配置好 Retry + HTTPAdapter 的 requests.Session 实例。
-
-    Example:
-        >>> s = make_session()
-        >>> r = s.get("https://example.com")
-        >>> s.close()
+        配置好 Retry + HTTPAdapter + 代理的 requests.Session 实例。
     """
+    from core.config import get_proxy
+
     s = requests.Session()
     retry = Retry(
         total=MAX_RETRIES,
@@ -50,6 +48,12 @@ def make_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+
+    # 代理
+    proxies = get_proxy()
+    if proxies:
+        s.proxies.update(proxies)
+
     return s
 
 

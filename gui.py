@@ -14,6 +14,7 @@ Web Resource Crawler — PyQt5 图形界面（View 层 + 轻量 Controller）。
 import sys
 import json
 import re
+from urllib.parse import urlparse
 import threading
 import logging
 from pathlib import Path
@@ -43,6 +44,7 @@ from core.constants import (
     HLS_DOWNLOAD_WORKERS,
     HLS_DOWNLOAD_WORKER_LIMIT,
     MAX_DOWNLOAD_WORKERS,
+    APP_VERSION,
 )
 from core.controller import normalize_urls, fetch_resources, get_label_for_urls
 
@@ -153,6 +155,25 @@ class DownloadWorker(QThread):
 # ──────────────────────────────────────────────────────────────────
 
 
+class _ImageLoadWorker(QThread):
+    """图片预览加载线程。"""
+    loaded = pyqtSignal(bytes)  # 图片数据
+    failed = pyqtSignal()
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self._url = url
+
+    def run(self) -> None:
+        try:
+            import requests as req
+            r = req.get(self._url, timeout=8, stream=True)
+            r.raise_for_status()
+            self.loaded.emit(r.content)
+        except Exception:
+            self.failed.emit()
+
+
 class MainWindow(QMainWindow):
     """Web Resource Crawler 主窗口。
 
@@ -169,18 +190,45 @@ class MainWindow(QMainWindow):
         QPushButton { background: #3c3c3c; color: #d4d4d4; border: 1px solid #505050;
                       border-radius: 4px; padding: 4px 12px; }
         QPushButton:hover { background: #4a4a4a; }
+        QPushButton:pressed { background: #555555; }
+        QPushButton:checked { background: #569cd6; color: #ffffff; border: 1px solid #569cd6; }
+        QPushButton:disabled { background: #2b2b2b; color: #666666; border: 1px solid #3c3c3c; }
         QLineEdit { background: #3c3c3c; color: #d4d4d4; border: 1px solid #505050;
                     border-radius: 4px; padding: 4px 8px; }
-        QTreeWidget, QListWidget, QTextEdit { background: #3c3c3c; color: #d4d4d4;
+        QLineEdit:focus { border: 1px solid #569cd6; }
+        QTreeWidget, QListWidget, QTextEdit { background: #1e1e1e; color: #d4d4d4;
                                               border: 1px solid #505050; border-radius: 4px; }
-        QTreeWidget::item:selected { background: #094771; }
+        QTreeWidget::item { padding: 2px 0px; }
+        QTreeWidget::item:selected { background: #094771; color: #ffffff; }
         QTreeWidget::item:hover { background: #2a2d2e; }
+        QTreeWidget::branch { background: #1e1e1e; }
         QHeaderView::section { background: #353535; color: #d4d4d4;
-                               border: 1px solid #505050; padding: 4px; }
-        QProgressBar { background: #3c3c3c; border: 1px solid #505050;
-                       border-radius: 4px; text-align: center; }
-        QProgressBar::chunk { background: #569cd6; border-radius: 3px; }
+                               border: 1px solid #505050; padding: 4px 8px;
+                               font-weight: bold; }
+        QProgressBar { background: #1e1e1e; border: 1px solid #505050;
+                       border-radius: 4px; text-align: center; color: #d4d4d4;
+                       min-height: 18px; }
+        QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                              stop:0 #569cd6, stop:1 #4ec9b0); border-radius: 3px; }
         QLabel { color: #d4d4d4; }
+        QMessageBox { background: #2b2b2b; }
+        QMessageBox QLabel { color: #d4d4d4; }
+        QToolTip { background: #353535; color: #d4d4d4; border: 1px solid #569cd6;
+                   padding: 4px; border-radius: 4px; }
+        QScrollBar:vertical {
+            background: #1e1e1e; width: 10px; margin: 0px; }
+        QScrollBar::handle:vertical {
+            background: #505050; min-height: 30px; border-radius: 5px; }
+        QScrollBar::handle:vertical:hover { background: #666666; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+        QScrollBar:horizontal {
+            background: #1e1e1e; height: 10px; margin: 0px; }
+        QScrollBar::handle:horizontal {
+            background: #505050; min-width: 30px; border-radius: 5px; }
+        QScrollBar::handle:horizontal:hover { background: #666666; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
     """
 
     def __init__(self) -> None:
@@ -208,6 +256,7 @@ class MainWindow(QMainWindow):
         # Worker 引用
         self._fetch_worker: Optional[FetchWorker] = None
         self._dl_worker: Optional[DownloadWorker] = None
+        self._img_worker: Optional[_ImageLoadWorker] = None
 
         # 下载管理中的条目映射
         self._dl_items: dict[str, QListWidgetItem] = {}
@@ -222,6 +271,9 @@ class MainWindow(QMainWindow):
         # 构建 UI
         self._build_ui()
         self._apply_theme(cfg.get("theme", "light") or "light")
+
+        # 启用拖放
+        self.setAcceptDrops(True)
 
     # ── 主题 ──────────────────────────────────────────────────
 
@@ -255,7 +307,7 @@ class MainWindow(QMainWindow):
             self.setPalette(p)
             self._theme_btn.setText("\u2600\ufe0f 亮色")  # ☀️ 亮色
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet("QPushButton:checked { background: #0078d4; color: #ffffff; border: 1px solid #0078d4; border-radius: 4px; }")
             self.setPalette(QApplication.style().standardPalette())
             self._theme_btn.setText("\U0001f319 暗色")  # 🌙 暗色
 
@@ -273,6 +325,10 @@ class MainWindow(QMainWindow):
         title_layout: QHBoxLayout = QHBoxLayout()
         title_label: QLabel = QLabel("\U0001f310  网页资源爬虫")
         title_label.setFont(QFont("Microsoft YaHei", 14))
+        version_label: QLabel = QLabel(f"v{APP_VERSION}")
+        version_label.setStyleSheet("color: #888; font-size: 11px;")
+        title_layout.addWidget(title_label)
+        title_layout.addWidget(version_label)
         title_layout.addWidget(title_label)
         title_layout.addStretch()
 
@@ -307,6 +363,21 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(change_dir_btn)
         dir_row.addStretch()
         url_layout.addLayout(dir_row)
+
+        # 代理设置行
+        proxy_row: QHBoxLayout = QHBoxLayout()
+        proxy_row.addWidget(QLabel("代理:"))
+        self._proxy_input: QLineEdit = QLineEdit()
+        self._proxy_input.setPlaceholderText("http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+        self._proxy_input.setMaximumWidth(300)
+        # 加载已保存的代理
+        saved_proxy: str = cfg.get("proxy", "") or ""
+        self._proxy_input.setText(saved_proxy)
+        self._proxy_input.textChanged.connect(self._on_proxy_changed)
+        proxy_row.addWidget(self._proxy_input)
+        proxy_row.addWidget(QLabel("\U0001f4a1 留空=直连"))
+        proxy_row.addStretch()
+        url_layout.addLayout(proxy_row)
         root_layout.addWidget(url_frame)
 
         # ── 三栏主内容区 ──
@@ -316,6 +387,7 @@ class MainWindow(QMainWindow):
         left_layout: QVBoxLayout = QVBoxLayout()
         left_layout.addWidget(QLabel("\U0001f4e5 下载管理"))
         self._dl_list: QListWidget = QListWidget()
+        self._dl_list.itemDoubleClicked.connect(self._on_dl_item_double_clicked)
         left_layout.addWidget(self._dl_list)
         content_layout.addLayout(left_layout, 1)
 
@@ -324,7 +396,11 @@ class MainWindow(QMainWindow):
 
         filter_row: QHBoxLayout = QHBoxLayout()
         filter_row.addWidget(QLabel("筛选:"))
+        self._filter_layout: QHBoxLayout = filter_row  # 保存引用，后续动态添加按钮
+        self._filter_buttons: list[QPushButton] = []  # 动态筛选按钮列表
         self._filter_all_btn: QPushButton = QPushButton("全部")
+        self._filter_all_btn.setCheckable(True)
+        self._filter_all_btn.setChecked(True)
         self._filter_all_btn.clicked.connect(lambda: self._on_filter(None))
         filter_row.addWidget(self._filter_all_btn)
         filter_row.addStretch()
@@ -366,8 +442,28 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("\U0001f4d6 资源预览"))
         self._preview_area: QTextEdit = QTextEdit()
         self._preview_area.setReadOnly(True)
-        self._preview_area.setMinimumWidth(250)
+        self._preview_area.setMaximumHeight(200)
         right_layout.addWidget(self._preview_area)
+        # 图片缩略图
+        self._preview_image: QLabel = QLabel()
+        self._preview_image.setAlignment(Qt.AlignCenter)
+        self._preview_image.setMinimumHeight(150)
+        self._preview_image.hide()  # 默认隐藏，点击图片资源时显示
+        right_layout.addWidget(self._preview_image)
+        # 音视频播放器（延迟初始化，因 QtMultimedia 可能不可用）
+        self._media_player = None
+        self._video_widget = None
+        try:
+            from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+            from PyQt5.QtMultimediaWidgets import QVideoWidget
+            self._media_player = QMediaPlayer()
+            self._video_widget = QVideoWidget()
+            self._video_widget.setMinimumHeight(200)
+            self._video_widget.hide()
+            self._media_player.setVideoOutput(self._video_widget)
+            right_layout.addWidget(self._video_widget)
+        except ImportError:
+            _log.info("[gui] QtMultimediaWidgets 不可用，音视频预览禁用")
         content_layout.addLayout(right_layout, 1)
 
         root_layout.addLayout(content_layout, 1)
@@ -379,11 +475,12 @@ class MainWindow(QMainWindow):
     # ── 资源树构建 ───────────────────────────────────────────
 
     def _build_resource_tree(self, resources: List[Resource]) -> None:
-        """将 Resource 列表按路径分组构建为树形结构。
+        """将 Resource 列表按路径/来源分组构建为树形结构。
 
         asmr.one 资源的 name 格式为「文件夹/子文件夹/文件名」，
-        按 '/' 拆分后逐层创建树节点。普通网页资源的 name 无路径分隔符，
-        直接挂在根节点下。
+        按 '/' 拆分后逐层创建树节点。
+        普通网页资源的 name 无路径分隔符，按 r.source（来源 URL）
+        提取域名分组，在根节点下创建「📄 域名」文件夹节点。
 
         Args:
             resources: 抓取到的资源列表。
@@ -392,8 +489,6 @@ class MainWindow(QMainWindow):
         self._res_tree.clear()
         self._leaf_to_resource.clear()
 
-        # 按路径前缀分组：路径 → {子路径 → ... 或 Resource}
-        # 使用 dict 逐层建树
         folder_nodes: Dict[str, QTreeWidgetItem] = {}  # path_str → node
 
         for r in resources:
@@ -403,11 +498,32 @@ class MainWindow(QMainWindow):
 
             parts = r.name.split("/")
             if len(parts) == 1:
-                # 无路径 — 直接挂根节点
-                leaf = QTreeWidgetItem(self._res_tree, [r.name, r.rtype])
+                # 无路径 — 按来源 URL 分组
+                source_key = ""
+                folder_label = ""
+                if r.source:
+                    parsed = urlparse(r.source)
+                    domain = parsed.netloc or parsed.path
+                    source_key = f"__source__{domain}"
+                    folder_label = f"📄 {domain}"
+
+                if source_key and source_key in folder_nodes:
+                    parent = folder_nodes[source_key]
+                elif source_key:
+                    folder_item = QTreeWidgetItem(
+                        self._res_tree, [folder_label, ""]
+                    )
+                    folder_item.setData(0, Qt.UserRole, None)
+                    folder_item.setCheckState(0, Qt.Unchecked)
+                    folder_item.setExpanded(True)
+                    folder_nodes[source_key] = folder_item
+                    parent = folder_item
+                else:
+                    parent = self._res_tree.invisibleRootItem()
+
+                leaf = QTreeWidgetItem(parent, [r.name, r.rtype])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
-                # 存储叶子节点 id → Resource 映射
                 self._leaf_to_resource[id(leaf)] = r
             else:
                 # 有路径 — 逐层创建文件夹节点
@@ -463,12 +579,62 @@ class MainWindow(QMainWindow):
         self._fetch_worker.finished.connect(self._on_fetch_done)
         self._fetch_worker.start()
 
+    # ── 筛选按钮动态生成 ───────────────────────────────────
+
+    # 资源类型 → emoji 映射
+    _TYPE_EMOJI: Dict[str, str] = {
+        "图片": "🖼️",
+        "音频": "🎵",
+        "视频": "🎬",
+        "音频-HLS": "📻",
+        "样式": "🎨",
+        "脚本": "📜",
+        "文档": "📄",
+        "字幕": "💬",
+        "其他": "❓",
+    }
+
+    def _update_filter_buttons(self, resources: List[Resource]) -> None:
+        """根据抓取结果动态生成类型筛选按钮。
+
+        清除旧按钮后，统计资源中出现的类型，生成带 emoji + 数量的筛选按钮。
+
+        Args:
+            resources: 当前资源列表。
+        """
+        # 清除旧按钮（保留“全部”按钮和 addStretch）
+        for btn in self._filter_buttons:
+            self._filter_layout.removeWidget(btn)
+            btn.deleteLater()
+        self._filter_buttons.clear()
+
+        # 统计各类型数量
+        type_counts: Dict[str, int] = {}
+        for r in resources:
+            type_counts[r.rtype] = type_counts.get(r.rtype, 0) + 1
+
+        # 按数量降序排列
+        sorted_types = sorted(type_counts.items(), key=lambda x: -x[1])
+
+        # 在“全部”按钮和 addStretch 之间插入新按钮
+        # layout 顺序: Label, 全部按钮, ..., addStretch
+        insert_index = 2  # 插入到“全部”按钮之后
+        for rtype, count in sorted_types:
+            emoji = self._TYPE_EMOJI.get(rtype, "")
+            btn = QPushButton(f"{emoji} {rtype} ({count})")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked, t=rtype: self._on_filter(t))
+            self._filter_layout.insertWidget(insert_index, btn)
+            self._filter_buttons.append(btn)
+            insert_index += 1
+
     def _on_fetch_done(self, label: str, resources: List[Resource]) -> None:
-        """FetchWorker 完成回调：构建资源树。"""
+        """FetchWorker 完成回调：构建资源树 + 更新筛选按钮。"""
         self.resources = resources
         self._current_filter = None
         self._status_label.setText(f"\u2705 找到 {len(resources)} 个资源")
 
+        self._update_filter_buttons(resources)
         self._build_resource_tree(resources)
 
     # ── 资源树交互 ───────────────────────────────────────────
@@ -532,12 +698,20 @@ class MainWindow(QMainWindow):
         self._update_parent_check(parent)
 
     def _on_filter(self, rtype: Optional[str]) -> None:
-        """按资源类型筛选列表。
+        """按资源类型筛选列表，更新按钮选中状态。
 
         Args:
             rtype: 类型字符串（如 '图片'）；None 表示显示全部。
         """
         self._current_filter = rtype
+
+        # 更新按钮选中状态
+        self._filter_all_btn.setChecked(rtype is None)
+        for btn in self._filter_buttons:
+            # 从按钮文本中提取类型名（去掉 emoji 和计数）
+            btn_rtype = btn.text().split(" ")[-2] if " (" in btn.text() else btn.text()
+            btn.setChecked(btn_rtype == rtype)
+
         self._build_resource_tree(self.resources)
 
     def _on_select_all(self) -> None:
@@ -602,12 +776,25 @@ class MainWindow(QMainWindow):
         self._count_label.setText(f"已选 {checked} 项")
 
     def _on_preview(self, item: QTreeWidgetItem, column: int) -> None:
-        """点击资源树项：右侧面板显示详细信息。
+        """点击资源树项：右侧面板显示详细信息 + 内嵌预览。
+
+        图片 → QPixmap 缩略图
+        音频 → QMediaPlayer 播放
+        视频 → QMediaPlayer + QVideoWidget 播放
+        HLS  → 显示 m3u8 信息（不可直接预览）
+        其他 → 文本详情
 
         Args:
             item: 被点击的 QTreeWidgetItem。
             column: 点击的列号。
         """
+        # 停止上一次播放
+        if self._media_player:
+            self._media_player.stop()
+        self._preview_image.hide()
+        if self._video_widget:
+            self._video_widget.hide()
+
         r: Optional[Resource] = item.data(0, Qt.UserRole)
         if r is None:
             # 文件夹节点 — 显示文件夹信息
@@ -620,12 +807,82 @@ class MainWindow(QMainWindow):
             """)
             return
 
-        self._preview_area.setHtml(f"""
-        <b>{r.rtype}</b><br><br>
+        # 基本信息
+        info_html = f"""
+        <b>{self._TYPE_EMOJI.get(r.rtype, '')} {r.rtype}</b><br><br>
         <b>文件名:</b> {r.name}<br><br>
         <b>URL:</b><br><small>{r.url}</small><br><br>
         <b>来源:</b> {getattr(r, 'source', '')}<br>
-        """)
+        """
+
+        # 按类型嵌入预览
+        if r.rtype == "图片":
+            # 尝试加载缩略图
+            from PyQt5.QtGui import QPixmap
+            from PyQt5.QtCore import QUrl
+            pixmap = QPixmap()
+            # 先尝试从网络加载（非阻塞，QPixmap 不支持直接从 URL 加载）
+            # 方案：后台下载小图，加载到 QPixmap
+            self._preview_image.setPixmap(pixmap)
+            self._preview_image.show()
+            self._preview_image.setText("⏳ 加载中...")
+            # 异步加载图片
+            self._load_preview_image(r.url)
+            info_html += "<hr><p><small>🖼️ 图片预览</small></p>"
+        elif r.rtype == "音频":
+            if self._media_player:
+                from PyQt5.QtCore import QUrl
+                from PyQt5.QtMultimedia import QMediaContent
+                self._media_player.setMedia(QMediaContent(QUrl(r.url)))
+                self._media_player.play()
+                info_html += "<hr><p><small>🎵 正在播放音频预览</small></p>"
+            else:
+                info_html += "<hr><p style=\"color:#888;\">🎵 音频预览不可用（缺少 QtMultimedia）</p>"
+        elif r.rtype == "视频":
+            if self._media_player and self._video_widget:
+                from PyQt5.QtCore import QUrl
+                from PyQt5.QtMultimedia import QMediaContent
+                self._video_widget.show()
+                self._media_player.setMedia(QMediaContent(QUrl(r.url)))
+                self._media_player.play()
+                info_html += "<hr><p><small>🎬 正在播放视频预览</small></p>"
+            else:
+                info_html += "<hr><p style=\"color:#888;\">🎬 视频预览不可用（缺少 QtMultimediaWidgets）</p>"
+        elif "HLS" in r.rtype:
+            info_html += "<hr><p style=\"color:#888;\">📻 HLS 流媒体 — 不支持在线预览，下载后播放</p>"
+
+        self._preview_area.setHtml(info_html)
+
+    def _load_preview_image(self, url: str) -> None:
+        """后台加载图片并显示到预览区。
+
+        Args:
+            url: 图片 URL。
+        """
+        self._img_worker = _ImageLoadWorker(url)
+        self._img_worker.loaded.connect(self._on_preview_image_loaded)
+        self._img_worker.failed.connect(lambda: self._preview_image.setText("❌ 图片加载失败"))
+        self._img_worker.start()
+
+    def _on_preview_image_loaded(self, data: bytes) -> None:
+        """图片加载完成回调（UI 线程执行）。
+
+        Args:
+            data: 图片二进制数据。
+        """
+        from PyQt5.QtGui import QPixmap
+        from PyQt5.QtCore import Qt
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self._preview_image.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self._preview_image.setPixmap(scaled)
+        else:
+            self._preview_image.setText("❌ 图片加载失败")
 
     # ── 下载流程 ─────────────────────────────────────────────
 
@@ -732,7 +989,7 @@ class MainWindow(QMainWindow):
         fail_list: List[Tuple[str, str]],
         stop_list: List[Tuple[str, str]],
     ) -> None:
-        """下载完成回调：显示最终结果。
+        """下载完成回调：显示最终结果 + 系统通知。
 
         Args:
             ok_list: [(url, path, filesize), ...] 成功条目。
@@ -758,10 +1015,39 @@ class MainWindow(QMainWindow):
             f"\u2705 完成: 成功 {len(ok_list)}, 失败 {len(fail_list)}"
         )
 
+        # 系统托盘通知（窗口最小化时特别有用）
+        self._show_tray_notification(len(ok_list), len(fail_list))
+
         QMessageBox.information(
             self, "下载结果",
             f"成功: {len(ok_list)} 项\n失败: {len(fail_list)} 项",
         )
+
+    def _show_tray_notification(self, ok_count: int, fail_count: int) -> None:
+        """显示系统托盘通知。
+
+        Args:
+            ok_count: 成功下载数。
+            fail_count: 失败下载数。
+        """
+        try:
+            from PyQt5.QtWidgets import QSystemTrayIcon
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray = QSystemTrayIcon(self)
+                # 使用应用图标或默认图标
+                from PyQt5.QtGui import QIcon
+                tray.setIcon(self.windowIcon() or QApplication.style().standardIcon(QApplication.style().SP_ComputerIcon))
+                tray.show()
+                title = "下载完成"
+                msg = f"成功: {ok_count} 项"
+                if fail_count > 0:
+                    msg += f", 失败: {fail_count} 项"
+                tray.showMessage(title, msg, QSystemTrayIcon.Information, 3000)
+                # 延迟隐藏托盘图标
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(4000, tray.hide)
+        except Exception:
+            pass  # 托盘不可用时静默忽略
 
     def _on_stop_download(self) -> None:
         """点击「停止」按钮：设置停止标志通知 Worker 中止。"""
@@ -779,6 +1065,69 @@ class MainWindow(QMainWindow):
             cfg["save_dir"] = directory
             save_config(cfg)
             self._status_label.setText(f"保存目录: {directory}")
+
+    def _on_proxy_changed(self, text: str) -> None:
+        """代理输入变更时实时保存到配置。"""
+        cfg = load_config()
+        cfg["proxy"] = text.strip()
+        save_config(cfg)
+        if text.strip():
+            self._status_label.setText(f"\U0001f310 代理已设置: {text.strip()}")
+        else:
+            self._status_label.setText("\U0001f310 直连（无代理）")
+
+    # ── 拖放 URL ──────────────────────────────────────────────
+
+    def dragEnterEvent(self, event) -> None:
+        """拖入事件：接受包含 URL 或文本的拖放。"""
+        if event.mimeData().hasUrls() or event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        """放下事件：提取 URL 填入输入框。"""
+        mime = event.mimeData()
+        urls: list[str] = []
+        if mime.hasUrls():
+            for url in mime.urls():
+                s = url.toString()
+                if s.startswith(("http://", "https://")):
+                    urls.append(s)
+        if not urls and mime.hasText():
+            for line in mime.text().strip().splitlines():
+                line = line.strip()
+                if line.startswith(("http://", "https://")):
+                    urls.append(line)
+        if urls:
+            self._url_input.setText(", ".join(urls))
+            self._status_label.setText(f"📥 已拖入 {len(urls)} 个 URL")
+
+    # ── 双击下载项打开文件位置 ─────────────────────────────────
+
+    def _on_dl_item_double_clicked(self, item: QListWidgetItem) -> None:
+        """双击下载管理列表项：打开文件所在目录。
+
+        Args:
+            item: 被双击的列表项。
+        """
+        text = item.text()
+        # 成功项格式: ✅ 文件名 (大小)
+        if not text.startswith("\u2705"):
+            return
+        # 提取文件名
+        fname = text.lstrip("\u2705 ").rsplit(" (", 1)[0].strip()
+        if not fname:
+            return
+        # 在保存目录中查找
+        target = self._save_dir / fname
+        if not target.exists():
+            # 递归搜索子目录
+            for p in self._save_dir.rglob(fname):
+                target = p
+                break
+        if target.exists():
+            import subprocess
+            # Windows: 选中文件并打开所在目录
+            subprocess.Popen(f'explorer /select,"{target}"')
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
     "max_workers": 6,
     "hls_workers": 24,
     "timeout": 30,
+    "proxy": "",  # HTTP/SOCKS5 代理，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
 }
 
 # Windows: %APPDATA%\WebScraper\config.json
@@ -87,3 +88,15 @@ def save_history(urls: list) -> None:
     cfg = load_config()
     cfg["history"] = urls[:50]
     save_config(cfg)
+
+
+def get_proxy() -> dict[str, str]:
+    """读取代理配置，返回 requests 可用的 proxies 字典。
+
+    Returns:
+        如 {"http": "http://...", "https": "http://..."}，或空字典表示无代理。
+    """
+    proxy_url = load_config().get("proxy", "").strip()
+    if not proxy_url:
+        return {}
+    return {"http": proxy_url, "https": proxy_url}
