@@ -24,14 +24,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QListWidget,
     QListWidgetItem, QFrame, QMessageBox, QFileDialog, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QHeaderView,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QCompleter,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QPalette, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QStringListModel
+from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap
 
 # 核心模块导入
 sys.path.insert(0, str(Path(__file__).parent))
-from core.scraper import fetch_html, parse_resources, Resource
+from core.fetcher import fetch_html
+from core.parser import parse_resources, Resource
 from core.downloader import download_all
 from core.config import (
     get_config_int,
@@ -275,6 +276,9 @@ class MainWindow(QMainWindow):
         # 启用拖放
         self.setAcceptDrops(True)
 
+        # 键盘快捷键
+        self._setup_shortcuts()
+
     # ── 主题 ──────────────────────────────────────────────────
 
     def _toggle_theme(self) -> None:
@@ -329,7 +333,6 @@ class MainWindow(QMainWindow):
         version_label.setStyleSheet("color: #888; font-size: 11px;")
         title_layout.addWidget(title_label)
         title_layout.addWidget(version_label)
-        title_layout.addWidget(title_label)
         title_layout.addStretch()
 
         self._theme_btn: QPushButton = QPushButton("\U0001f319 暗色")
@@ -348,12 +351,22 @@ class MainWindow(QMainWindow):
         self._url_input: QLineEdit = QLineEdit()
         self._url_input.setPlaceholderText("https://example.com")
         self._url_input.returnPressed.connect(self._on_fetch)
+        self._url_completer: QCompleter = QCompleter(self._history, self)
+        self._url_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._url_completer.setMaxVisibleItems(10)
+        self._url_input.setCompleter(self._url_completer)
         input_row.addWidget(self._url_input)
 
-        fetch_btn: QPushButton = QPushButton("\U0001f50d  抓 取")
-        fetch_btn.setMinimumWidth(100)
-        fetch_btn.clicked.connect(self._on_fetch)
-        input_row.addWidget(fetch_btn)
+        self._history_btn: QPushButton = QPushButton("\U0001f4c3")
+        self._history_btn.setToolTip("URL 历史")
+        self._history_btn.setFixedWidth(36)
+        self._history_btn.clicked.connect(self._on_show_history)
+        input_row.addWidget(self._history_btn)
+
+        self._fetch_btn: QPushButton = QPushButton("\U0001f50d  抓 取")
+        self._fetch_btn.setMinimumWidth(100)
+        self._fetch_btn.clicked.connect(self._on_fetch)
+        input_row.addWidget(self._fetch_btn)
         url_layout.addLayout(input_row)
 
         dir_row: QHBoxLayout = QHBoxLayout()
@@ -371,9 +384,9 @@ class MainWindow(QMainWindow):
         self._proxy_input.setPlaceholderText("http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
         self._proxy_input.setMaximumWidth(300)
         # 加载已保存的代理
-        saved_proxy: str = cfg.get("proxy", "") or ""
+        saved_proxy: str = load_config().get("proxy", "") or ""
         self._proxy_input.setText(saved_proxy)
-        self._proxy_input.textChanged.connect(self._on_proxy_changed)
+        self._proxy_input.textChanged.connect(self._on_proxy_text_changed)
         proxy_row.addWidget(self._proxy_input)
         proxy_row.addWidget(QLabel("\U0001f4a1 留空=直连"))
         proxy_row.addStretch()
@@ -426,12 +439,13 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 100)
         action_row.addWidget(self._progress)
 
-        dl_btn: QPushButton = QPushButton("\u2b07  下 载")
-        dl_btn.setMinimumWidth(100)
-        dl_btn.clicked.connect(self._on_download)
-        action_row.addWidget(dl_btn)
+        self._dl_btn: QPushButton = QPushButton("\u2b07  下 载")
+        self._dl_btn.setMinimumWidth(100)
+        self._dl_btn.clicked.connect(self._on_download)
+        action_row.addWidget(self._dl_btn)
 
         self._stop_btn: QPushButton = QPushButton("\u23f9 停止")
+        self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._on_stop_download)
         action_row.addWidget(self._stop_btn)
         mid_layout.addLayout(action_row)
@@ -475,12 +489,12 @@ class MainWindow(QMainWindow):
     # ── 资源树构建 ───────────────────────────────────────────
 
     def _build_resource_tree(self, resources: List[Resource]) -> None:
-        """将 Resource 列表按路径/来源分组构建为树形结构。
+        """将 Resource 列表按类型分组构建为树形结构。
 
-        asmr.one 资源的 name 格式为「文件夹/子文件夹/文件名」，
-        按 '/' 拆分后逐层创建树节点。
-        普通网页资源的 name 无路径分隔符，按 r.source（来源 URL）
-        提取域名分组，在根节点下创建「📄 域名」文件夹节点。
+        顶层按资源类型（r.rtype）分组，创建带 emoji 的类型文件夹节点
+        （如 🖼️ 图片、🎵 音频）。类型文件夹下：
+        - 无路径资源：再按来源域名创建子文件夹，文件挂在域名下
+        - 有路径资源（如 asmr.one）：保持原有路径层级展开
 
         Args:
             resources: 抓取到的资源列表。
@@ -496,52 +510,64 @@ class MainWindow(QMainWindow):
             if self._current_filter is not None and r.rtype != self._current_filter:
                 continue
 
+            # ── 1. 顶层类型文件夹 ──
+            rtype = r.rtype or "其他"
+            type_key = f"__type__{rtype}"
+            type_emoji = self._TYPE_EMOJI.get(rtype, "📁")
+            type_label = f"{type_emoji} {rtype}"
+
+            if type_key in folder_nodes:
+                type_node = folder_nodes[type_key]
+            else:
+                type_node = QTreeWidgetItem(self._res_tree, [type_label, ""])
+                type_node.setData(0, Qt.UserRole, None)
+                type_node.setCheckState(0, Qt.Unchecked)
+                type_node.setExpanded(True)
+                folder_nodes[type_key] = type_node
+
+            # ── 2. 类型下的子结构 ──
             parts = r.name.split("/")
             if len(parts) == 1:
-                # 无路径 — 按来源 URL 分组
+                # 无路径 — 按来源域名再分组
                 source_key = ""
-                folder_label = ""
                 if r.source:
                     parsed = urlparse(r.source)
                     domain = parsed.netloc or parsed.path
-                    source_key = f"__source__{domain}"
-                    folder_label = f"📄 {domain}"
+                    source_key = f"{type_key}/__source__{domain}"
 
                 if source_key and source_key in folder_nodes:
                     parent = folder_nodes[source_key]
                 elif source_key:
-                    folder_item = QTreeWidgetItem(
-                        self._res_tree, [folder_label, ""]
-                    )
-                    folder_item.setData(0, Qt.UserRole, None)
-                    folder_item.setCheckState(0, Qt.Unchecked)
-                    folder_item.setExpanded(True)
-                    folder_nodes[source_key] = folder_item
-                    parent = folder_item
+                    domain_item = QTreeWidgetItem(type_node, [f"📄 {domain}", ""])
+                    domain_item.setData(0, Qt.UserRole, None)
+                    domain_item.setCheckState(0, Qt.Unchecked)
+                    domain_item.setExpanded(True)
+                    folder_nodes[source_key] = domain_item
+                    parent = domain_item
                 else:
-                    parent = self._res_tree.invisibleRootItem()
+                    parent = type_node
 
                 leaf = QTreeWidgetItem(parent, [r.name, r.rtype])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
                 self._leaf_to_resource[id(leaf)] = r
             else:
-                # 有路径 — 逐层创建文件夹节点
-                parent: QTreeWidgetItem = self._res_tree.invisibleRootItem()
-                path_so_far: str = ""
-                for i, part in enumerate(parts[:-1]):
-                    path_so_far = f"{path_so_far}/{part}" if path_so_far else part
+                # 有路径 — 保持原有层级，挂在类型节点下
+                parent: QTreeWidgetItem = type_node
+                path_so_far: str = type_key
+                for part in parts[:-1]:
+                    path_so_far = f"{path_so_far}/{part}"
                     if path_so_far in folder_nodes:
                         parent = folder_nodes[path_so_far]
                     else:
                         folder_item = QTreeWidgetItem(parent, [f"📁 {part}", ""])
-                        folder_item.setData(0, Qt.UserRole, None)  # 文件夹无 Resource
+                        folder_item.setData(0, Qt.UserRole, None)
                         folder_item.setCheckState(0, Qt.Unchecked)
                         folder_item.setExpanded(True)
                         folder_nodes[path_so_far] = folder_item
                         parent = folder_item
 
-                # 叶子节点（文件名 = parts[-1]）
+                # 叶子节点
                 leaf = QTreeWidgetItem(parent, [parts[-1], r.rtype])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
@@ -567,6 +593,7 @@ class MainWindow(QMainWindow):
             self._history.insert(0, urls[0])
             self._history = self._history[:50]
             save_history(self._history)
+            self._url_completer.setModel(QStringListModel(self._history))
 
         # 清空上一轮结果
         self._res_tree.clear()
@@ -575,6 +602,8 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"\u23f3 正在抓取 {len(urls)} 个网页...")
 
         # 启动抓取线程
+        self._fetch_btn.setEnabled(False)
+        self._dl_btn.setEnabled(False)
         self._fetch_worker = FetchWorker(urls)
         self._fetch_worker.finished.connect(self._on_fetch_done)
         self._fetch_worker.start()
@@ -630,6 +659,8 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_done(self, label: str, resources: List[Resource]) -> None:
         """FetchWorker 完成回调：构建资源树 + 更新筛选按钮。"""
+        self._fetch_btn.setEnabled(True)
+        self._dl_btn.setEnabled(True)
         self.resources = resources
         self._current_filter = None
         self._status_label.setText(f"\u2705 找到 {len(resources)} 个资源")
@@ -818,8 +849,6 @@ class MainWindow(QMainWindow):
         # 按类型嵌入预览
         if r.rtype == "图片":
             # 尝试加载缩略图
-            from PyQt5.QtGui import QPixmap
-            from PyQt5.QtCore import QUrl
             pixmap = QPixmap()
             # 先尝试从网络加载（非阻塞，QPixmap 不支持直接从 URL 加载）
             # 方案：后台下载小图，加载到 QPixmap
@@ -831,7 +860,6 @@ class MainWindow(QMainWindow):
             info_html += "<hr><p><small>🖼️ 图片预览</small></p>"
         elif r.rtype == "音频":
             if self._media_player:
-                from PyQt5.QtCore import QUrl
                 from PyQt5.QtMultimedia import QMediaContent
                 self._media_player.setMedia(QMediaContent(QUrl(r.url)))
                 self._media_player.play()
@@ -840,7 +868,6 @@ class MainWindow(QMainWindow):
                 info_html += "<hr><p style=\"color:#888;\">🎵 音频预览不可用（缺少 QtMultimedia）</p>"
         elif r.rtype == "视频":
             if self._media_player and self._video_widget:
-                from PyQt5.QtCore import QUrl
                 from PyQt5.QtMultimedia import QMediaContent
                 self._video_widget.show()
                 self._media_player.setMedia(QMediaContent(QUrl(r.url)))
@@ -870,8 +897,6 @@ class MainWindow(QMainWindow):
         Args:
             data: 图片二进制数据。
         """
-        from PyQt5.QtGui import QPixmap
-        from PyQt5.QtCore import Qt
         pixmap = QPixmap()
         pixmap.loadFromData(data)
         if not pixmap.isNull():
@@ -916,6 +941,11 @@ class MainWindow(QMainWindow):
         self._stop_flag.clear()
         self._status_label.setText("\U0001f4fb 开始下载...")
         self._dl_list.clear()
+
+        # 禁用抓取/下载按钮，启用停止按钮
+        self._fetch_btn.setEnabled(False)
+        self._dl_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
 
         # 构建下载条目列表（用 URL 作 key，避免文件名截取匹配不可靠）
         self._dl_items = {}
@@ -978,8 +1008,9 @@ class MainWindow(QMainWindow):
                     break
 
         if self._global_item is not None:
+            total_pct: int = int(done / total * 100) if total else 0
             self._global_item.setText(
-                f"总进度: [{done}/{total}] {name[:30]}"
+                f"总进度: [{done}/{total}] {total_pct}% — {name[:25]}"
             )
         self._status_label.setText(f"\U0001f4e5 [{done}/{total}] {name[:30]}")
 
@@ -998,6 +1029,11 @@ class MainWindow(QMainWindow):
         """
         self._downloading = False
         self._progress.setValue(100)
+
+        # 恢复按钮状态
+        self._fetch_btn.setEnabled(True)
+        self._dl_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
 
         self._dl_list.clear()
         for _, path, sz in ok_list:
@@ -1066,8 +1102,18 @@ class MainWindow(QMainWindow):
             save_config(cfg)
             self._status_label.setText(f"保存目录: {directory}")
 
-    def _on_proxy_changed(self, text: str) -> None:
-        """代理输入变更时实时保存到配置。"""
+    def _on_proxy_text_changed(self, text: str) -> None:
+        """代理输入变更时启动防抖计时器（500ms 后保存）。"""
+        if not hasattr(self, '_proxy_timer'):
+            from PyQt5.QtCore import QTimer
+            self._proxy_timer = QTimer()
+            self._proxy_timer.setSingleShot(True)
+            self._proxy_timer.timeout.connect(self._on_proxy_changed)
+        self._proxy_timer.start(500)
+
+    def _on_proxy_changed(self) -> None:
+        """代理输入防抖回调：保存到配置。"""
+        text = self._proxy_input.text()
         cfg = load_config()
         cfg["proxy"] = text.strip()
         save_config(cfg)
@@ -1128,6 +1174,88 @@ class MainWindow(QMainWindow):
             import subprocess
             # Windows: 选中文件并打开所在目录
             subprocess.Popen(f'explorer /select,"{target}"')
+
+    # ── URL 历史弹出菜单 ─────────────────────────────────────
+
+    def _on_show_history(self) -> None:
+        """点击历史按钮：弹出菜单，列出历史 URL，点击选用，底部可清除。"""
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+        if not self._history:
+            act = menu.addAction("（无历史记录）")
+            act.setEnabled(False)
+        else:
+            for url in self._history[:20]:
+                display = url if len(url) <= 60 else url[:57] + "..."
+                action = menu.addAction(display)
+                action.setData(url)
+                action.triggered.connect(self._on_pick_history)
+            menu.addSeparator()
+            clear_act = menu.addAction("🗑 清除历史")
+            clear_act.triggered.connect(self._on_clear_history)
+        menu.exec_(self._history_btn.mapToGlobal(self._history_btn.rect().bottomLeft()))
+
+    def _on_pick_history(self) -> None:
+        """选中历史 URL → 填入输入框。"""
+        action = self.sender()
+        if action and action.data():
+            self._url_input.setText(action.data())
+            self._url_input.setFocus()
+
+    def _on_clear_history(self) -> None:
+        """清除全部 URL 历史。"""
+        reply = QMessageBox.question(
+            self, "清除历史",
+            "确定要清除所有 URL 历史记录吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._history.clear()
+            save_history(self._history)
+            self._url_completer.setModel(QStringListModel(self._history))
+            self._status_label.setText("🗑 URL 历史已清除")
+
+    # ── 键盘快捷键 ─────────────────────────────────────────
+
+    def _setup_shortcuts(self) -> None:
+        """注册全局键盘快捷键。"""
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        # Ctrl+Enter: 抓取
+        QShortcut(QKeySequence("Ctrl+Return"), self, self._on_fetch)
+        # Ctrl+D: 下载
+        QShortcut(QKeySequence("Ctrl+D"), self, self._on_download)
+        # Escape: 停止下载
+        QShortcut(QKeySequence("Escape"), self, self._on_stop_download)
+
+    # ── 关闭窗口确认 ──────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        """关闭窗口时：若正在下载，弹出确认对话框。"""
+        if self._downloading:
+            reply = QMessageBox.question(
+                self, "确认关闭",
+                "正在下载中，关闭窗口将中断下载。\n确定要关闭吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+            # 用户确认关闭，停止下载
+            self._stop_flag.set()
+        elif self._fetch_worker is not None and self._fetch_worker.isRunning():
+            reply = QMessageBox.question(
+                self, "确认关闭",
+                "正在抓取中，关闭窗口将中断操作。\n确定要关闭吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+        event.accept()
 
 
 # ──────────────────────────────────────────────────────────────────

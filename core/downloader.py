@@ -39,6 +39,7 @@ from core.constants import (
     DEFAULT_USER_AGENT as _USER_AGENT,
     STOPPED_MARKER,
 )
+from core.config import get_proxy
 
 _log = logging.getLogger('downloader')
 
@@ -50,8 +51,6 @@ _RETRY_TOTAL: int = 3
 
 def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> requests.Session:
     """创建带 Retry 策略的 Session（连接池复用 + 代理）。"""
-    from core.config import get_proxy
-
     s = requests.Session()
     retry = Retry(
         total=_RETRY_TOTAL,
@@ -253,8 +252,7 @@ def download_file(
         output = output_path
     else:
         name: str = url.split('/')[-1].split('?')[0] or 'download'
-        safe_name: str = re.sub(r'[\\/:*?\"<>|]', '', name)
-        output: Path = save_dir / safe_name
+        output: Path = save_dir / _safe_path(name)
 
     # 确保父目录存在
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -593,7 +591,7 @@ def download_all(
 
     try:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='dl') as normal_pool, \
-             ThreadPoolExecutor(max_workers=min(len(hls_items), 4), thread_name_prefix='hls') as hls_pool:
+             ThreadPoolExecutor(max_workers=min(len(hls_items), hls_max_workers or 4), thread_name_prefix='hls') as hls_pool:
 
             normal_futures = []
             hls_futures = []

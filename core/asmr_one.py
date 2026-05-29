@@ -18,6 +18,7 @@ from core.constants import (
     ASMR_API_WORK_INFO,
     ASMR_API_TRACKS,
 )
+from core.fetcher import make_session
 
 _log = logging.getLogger("asmr_one")
 
@@ -67,10 +68,11 @@ def parse_asmr_one(url: str) -> list:
 
     rj = match.group(1)
     resources: list[Resource] = []
+    sess = make_session()
 
     try:
         # 1. 获取作品元数据 → 拿到数字 ID
-        info_r = requests.get(
+        info_r = sess.get(
             ASMR_API_WORK_INFO.format(rj),
             headers={"User-Agent": USER_AGENTS[0]},
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
@@ -82,7 +84,7 @@ def parse_asmr_one(url: str) -> list:
             return []
 
         # 2. 获取文件树
-        tracks_r = requests.get(
+        tracks_r = sess.get(
             ASMR_API_TRACKS.format(work_id),
             headers={"User-Agent": USER_AGENTS[0]},
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
@@ -137,5 +139,10 @@ def parse_asmr_one(url: str) -> list:
         _log.error(f"[asmr.one] 数据解析失败 {rj}: {e}")
     except Exception as e:
         _log.error(f"[asmr.one] 未知错误 {rj}: {e}")
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
 
     return resources

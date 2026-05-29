@@ -11,6 +11,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.asmr_one import is_asmr_one, parse_asmr_one
 
 
+def _mock_session(get_side_effect=None):
+    """创建一个 mock Session 对象，.get 返回指定 side_effect。"""
+    sess = MagicMock()
+    if get_side_effect is not None:
+        sess.get.side_effect = get_side_effect
+    sess.close.return_value = None
+    return sess
+
+
 class TestIsAsmrOne:
     """asmr.one URL 识别测试"""
 
@@ -31,10 +40,10 @@ class TestIsAsmrOne:
 
 
 class TestParseAsmrOne:
-    """asmr.one API 解析测试（mock requests.get）"""
+    """asmr.one API 解析测试（mock make_session）"""
 
-    @patch("core.asmr_one.requests.get")
-    def test_parse_audio_files(self, mock_get):
+    @patch("core.asmr_one.make_session")
+    def test_parse_audio_files(self, mock_make_session):
         """正常 API 返回音频资源"""
         # mock workInfo 响应
         info_resp = MagicMock()
@@ -68,7 +77,9 @@ class TestParseAsmrOne:
         ]
         tracks_resp.raise_for_status = MagicMock()
 
-        mock_get.side_effect = [info_resp, tracks_resp]
+        mock_make_session.return_value = _mock_session(
+            get_side_effect=[info_resp, tracks_resp]
+        )
 
         resources = parse_asmr_one("https://asmr.one/work/RJ01000000")
         assert len(resources) == 3
@@ -81,35 +92,41 @@ class TestParseAsmrOne:
         scene1 = [r for r in resources if "scene1" in r.name][0]
         assert "Chapter 1" in scene1.name
 
-    @patch("core.asmr_one.requests.get")
-    def test_api_error_returns_empty(self, mock_get):
+    @patch("core.asmr_one.make_session")
+    def test_api_error_returns_empty(self, mock_make_session):
         """API 请求失败返回空列表"""
         import requests
-        mock_get.side_effect = requests.RequestException("Network error")
+        sess = MagicMock()
+        sess.get.side_effect = requests.RequestException("Network error")
+        sess.close.return_value = None
+        mock_make_session.return_value = sess
 
         resources = parse_asmr_one("https://asmr.one/work/RJ99999999")
         assert resources == []
 
-    @patch("core.asmr_one.requests.get")
-    def test_no_work_id_returns_empty(self, mock_get):
+    @patch("core.asmr_one.make_session")
+    def test_no_work_id_returns_empty(self, mock_make_session):
         """workInfo 返回无 id 字段"""
         info_resp = MagicMock()
         info_resp.json.return_value = {"title": "test"}  # 没有 id
         info_resp.raise_for_status = MagicMock()
-        mock_get.return_value = info_resp
+
+        mock_make_session.return_value = _mock_session(
+            get_side_effect=[info_resp]
+        )
 
         resources = parse_asmr_one("https://asmr.one/work/RJ00000000")
         assert resources == []
 
-    @patch("core.asmr_one.requests.get")
-    def test_invalid_url_returns_empty(self, mock_get):
+    @patch("core.asmr_one.make_session")
+    def test_invalid_url_returns_empty(self, mock_make_session):
         """非 asmr.one URL 返回空列表"""
         resources = parse_asmr_one("https://example.com/page")
         assert resources == []
-        mock_get.assert_not_called()
+        mock_make_session.assert_not_called()
 
-    @patch("core.asmr_one.requests.get")
-    def test_video_type(self, mock_get):
+    @patch("core.asmr_one.make_session")
+    def test_video_type(self, mock_make_session):
         """video 类型资源也正确提取"""
         info_resp = MagicMock()
         info_resp.json.return_value = {"id": 1}
@@ -125,7 +142,9 @@ class TestParseAsmrOne:
         ]
         tracks_resp.raise_for_status = MagicMock()
 
-        mock_get.side_effect = [info_resp, tracks_resp]
+        mock_make_session.return_value = _mock_session(
+            get_side_effect=[info_resp, tracks_resp]
+        )
 
         resources = parse_asmr_one("https://asmr.one/work/RJ01000001")
         assert len(resources) == 1
