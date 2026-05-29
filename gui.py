@@ -24,7 +24,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QListWidget,
     QListWidgetItem, QFrame, QMessageBox, QFileDialog, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QCompleter,
+    QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QHeaderView,
+    QCompleter,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QStringListModel
 from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap
@@ -753,7 +754,7 @@ class MainWindow(QMainWindow):
             item = it.value()
             if id(item) in self._leaf_to_resource:
                 item.setCheckState(0, Qt.Checked)
-            it.__next__()
+            it += 1
         # 更新所有文件夹节点状态
         self._sync_all_folder_checks()
         self._res_tree.blockSignals(False)
@@ -766,7 +767,7 @@ class MainWindow(QMainWindow):
         while it.value():
             item = it.value()
             item.setCheckState(0, Qt.Unchecked)
-            it.__next__()
+            it += 1
         self._res_tree.blockSignals(False)
         self._update_count()
 
@@ -779,7 +780,7 @@ class MainWindow(QMainWindow):
             item = it.value()
             if id(item) in self._leaf_to_resource:
                 leaves.append(item)
-            it.__next__()
+            it += 1
 
         # 从叶子向上递归更新
         updated_parents: set = set()
@@ -792,18 +793,13 @@ class MainWindow(QMainWindow):
 
     def _update_count(self) -> None:
         """更新「已选 N 项」标签。"""
-        checked: int = sum(
-            1 for item_id, r in self._leaf_to_resource.items()
-            # 需要从树中找到对应节点
-        )
-        # 遍历树统计勾选的叶子
         checked = 0
         it = QTreeWidgetItemIterator(self._res_tree)
         while it.value():
             item = it.value()
             if id(item) in self._leaf_to_resource and item.checkState(0) == Qt.Checked:
                 checked += 1
-            it.__next__()
+            it += 1
         self._count_label.setText(f"已选 {checked} 项")
 
     def _on_preview(self, item: QTreeWidgetItem, column: int) -> None:
@@ -925,7 +921,7 @@ class MainWindow(QMainWindow):
                 r = item.data(0, Qt.UserRole)
                 if r is not None:
                     checked.append(r)
-            it.__next__()
+            it += 1
         return checked
 
     def _on_download(self) -> None:
