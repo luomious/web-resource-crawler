@@ -1085,6 +1085,9 @@ class MainWindow(QMainWindow):
         for _, err in fail_list:
             self._dl_list.addItem(f"\u274c {err[:60]}")
 
+        # 滚动到列表底部
+        self._dl_list.scrollToBottom()
+
         self._status_label.setText(
             f"\u2705 完成: 成功 {len(ok_list)}, 失败 {len(fail_list)}"
         )
@@ -1105,10 +1108,18 @@ class MainWindow(QMainWindow):
             if len(fail_list) > 5:
                 msg_parts.append(f"  ... 还有 {len(fail_list) - 5} 个错误")
         
-        QMessageBox.information(
-            self, "下载结果",
-            "\n".join(msg_parts),
-        )
+        # 带自定义按钮的结果弹窗
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("下载结果")
+        msg_box.setText("\n".join(msg_parts))
+        open_btn = msg_box.addButton("打开文件夹", QMessageBox.ActionRole)
+        msg_box.addButton(QMessageBox.Ok)
+        msg_box.exec_()
+        if msg_box.clickedButton() == open_btn and ok_list:
+            # 打开第一个成功文件的所在目录
+            first_path = Path(ok_list[0][1])
+            import subprocess
+            subprocess.Popen(f'explorer /select,"{first_path}"')
 
     def _show_tray_notification(self, ok_count: int, fail_count: int) -> None:
         """显示系统托盘通知。
