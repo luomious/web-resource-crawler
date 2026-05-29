@@ -103,7 +103,11 @@ def fetch_html(url: str) -> str:
                 html = resp.content.decode("utf-8", errors="replace")
         return html
     finally:
-        s.close()
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 
 def fetch_all_urls(urls: list[str], max_workers: int = MAX_FETCH_WORKERS) -> list[Resource]:

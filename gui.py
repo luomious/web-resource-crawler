@@ -65,8 +65,10 @@ class FetchWorker(QThread):
 
     Signals:
         finished(str, list[Resource]): (显示标签, 去重资源列表)
+        error(str): 错误信息
     """
     finished = pyqtSignal(str, list)
+    error = pyqtSignal(str)
 
     def __init__(self, urls: List[str]) -> None:
         """初始化抓取线程。
@@ -79,9 +81,15 @@ class FetchWorker(QThread):
 
     def run(self) -> None:
         """执行抓取（在后台线程中运行，禁止直接操作 UI）。"""
-        all_resources = fetch_resources(self._urls)
-        label = get_label_for_urls(self._urls)
-        self.finished.emit(label, all_resources)
+        try:
+            all_resources = fetch_resources(self._urls)
+            label = get_label_for_urls(self._urls)
+            self.finished.emit(label, all_resources)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            _log.error(f'[FetchWorker] 未捕获异常: {tb}')
+            self.error.emit(f'抓取失败: {e}')
 
 
 class DownloadWorker(QThread):
@@ -142,6 +150,8 @@ class DownloadWorker(QThread):
                 hls_max_workers=self._hls_max_workers,
             )
         except Exception as e:
+            import traceback as _tb
+            _log.error(f'[DownloadWorker] 未捕获异常: {_tb.format_exc()}')
             failed = [(r.url, str(e)) for r in self._resources]
             self.finished.emit([], failed, [])
             return
@@ -607,6 +617,7 @@ class MainWindow(QMainWindow):
         self._dl_btn.setEnabled(False)
         self._fetch_worker = FetchWorker(urls)
         self._fetch_worker.finished.connect(self._on_fetch_done)
+        self._fetch_worker.error.connect(self._on_fetch_error)
         self._fetch_worker.start()
 
     # ── 筛选按钮动态生成 ───────────────────────────────────
@@ -657,6 +668,13 @@ class MainWindow(QMainWindow):
             self._filter_layout.insertWidget(insert_index, btn)
             self._filter_buttons.append(btn)
             insert_index += 1
+
+    def _on_fetch_error(self, msg: str) -> None:
+        """FetchWorker 异常回调。"""
+        self._fetch_btn.setEnabled(True)
+        self._dl_btn.setEnabled(True)
+        self._status_label.setText(f"\u274c {msg}")
+        QMessageBox.warning(self, "抓取失败", msg)
 
     def _on_fetch_done(self, label: str, resources: List[Resource]) -> None:
         """FetchWorker 完成回调：构建资源树 + 更新筛选按钮。"""
@@ -1259,6 +1277,47 @@ class MainWindow(QMainWindow):
 # ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # 全局异常钩子：将未捕获异常完整 traceback 写入日志文件
+    _orig_excepthook = sys.excepthook
+
+    def _global_excepthook(exc_type, exc_value, exc_tb):
+        import traceback as _tb
+        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        # 写入日志文件
+        log_path = Path.home() / "web_crawler_crash.log"
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                import datetime as _dt
+                f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{tb_text}")
+        except Exception:
+            pass
+        # 也打印到 stderr
+        _orig_excepthook(exc_type, exc_value, exc_tb)
+        # 尝试弹窗显示完整错误
+        try:
+            if QApplication.instance() is None:
+                app = QApplication(sys.argv)
+            QMessageBox.critical(None, "错误", f"未捕获异常:\n\n{tb_text[:2000]}")
+        except Exception:
+            pass
+
+    sys.excepthook = _global_excepthook
+
+    # QThread 未捕获异常钩子
+    def _qthread_excepthook(exc_type, exc_value, exc_tb):
+        import traceback as _tb
+        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        log_path = Path.home() / "web_crawler_crash.log"
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                import datetime as _dt
+                f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S} [QThread]\n{tb_text}")
+        except Exception:
+            pass
+
+    # PyQt5 QThread 的 uncaught exception 默认走 sys.excepthook
+    # 但 --windowed 模式下 PyInstaller 覆盖了 sys.excepthook，所以需要恢复
+
     app: QApplication = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
     window: MainWindow = MainWindow()

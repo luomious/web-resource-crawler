@@ -556,7 +556,11 @@ def download_hls(
                 sessions_to_close = list(sessions)
                 sessions.clear()
             for s in sessions_to_close:
-                s.close()
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:
+                    pass
 
         if stopped:
             _cleanup_hls_tmp_dir(tmp_dir, total)
@@ -727,7 +731,11 @@ def download_all(
                     break
 
     finally:
-        shared_session.close()
+        try:
+            if shared_session is not None:
+                shared_session.close()
+        except Exception as e:
+            _log.warning(f'[download_all] 关闭 shared_session 异常: {e}')
 
     # 下载完成后：扫描字幕文件并嵌入对应音视频
     if not (stop_flag and stop_flag.is_set()):
