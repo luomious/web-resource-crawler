@@ -14,6 +14,7 @@ Web Resource Crawler — PyQt5 图形界面（View 层 + 轻量 Controller）。
 import sys
 import json
 import re
+import time
 from urllib.parse import urlparse
 import threading
 import logging
@@ -284,6 +285,11 @@ class MainWindow(QMainWindow):
         self._dl_items: dict[str, QListWidgetItem] = {}
         self._global_item: Optional[QListWidgetItem] = None
 
+        # 下载速度追踪
+        self._dl_start_time: float = 0.0
+        self._dl_last_done: int = 0
+        self._dl_last_time: float = 0.0
+
         # 资源树中叶子节点 → Resource 的映射（用于快速查找）
         self._leaf_to_resource: Dict[int, Resource] = {}
 
@@ -439,6 +445,13 @@ class MainWindow(QMainWindow):
         self._filter_all_btn.clicked.connect(lambda: self._on_filter(None))
         filter_row.addWidget(self._filter_all_btn)
         filter_row.addStretch()
+        # 搜索框
+        self._search_input: QLineEdit = QLineEdit()
+        self._search_input.setPlaceholderText("🔍 搜索资源名...")
+        self._search_input.setMaximumWidth(200)
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self._on_search_changed)
+        filter_row.addWidget(self._search_input)
         mid_layout.addLayout(filter_row)
 
         self._res_tree: QTreeWidget = QTreeWidget()
@@ -449,6 +462,8 @@ class MainWindow(QMainWindow):
         self._res_tree.setColumnWidth(1, 80)
         self._res_tree.itemClicked.connect(self._on_preview)
         self._res_tree.itemChanged.connect(self._on_item_changed)
+        self._res_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._res_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         mid_layout.addWidget(self._res_tree)
 
         action_row: QHBoxLayout = QHBoxLayout()
@@ -621,6 +636,7 @@ class MainWindow(QMainWindow):
         self._res_tree.clear()
         self._leaf_to_resource.clear()
         self._preview_area.clear()
+        self._search_input.clear()  # 清空搜索框
         self._status_label.setText(f"\u23f3 正在抓取 {len(urls)} 个网页...")
 
         # 启动抓取线程
@@ -775,6 +791,67 @@ class MainWindow(QMainWindow):
 
         self._build_resource_tree(self.resources)
 
+    # ── 搜索过滤 ─────────────────────────────────────────────
+
+    def _on_search_changed(self, text: str) -> None:
+        """搜索框文本变化时，实时过滤资源树。"""
+        keyword = text.strip().lower()
+        if not keyword:
+            # 清空搜索时，恢复所有节点可见
+            self._apply_search_visibility(None)
+            return
+        self._apply_search_visibility(keyword)
+
+    def _apply_search_visibility(self, keyword: Optional[str]) -> None:
+        """根据搜索关键词设置资源树节点可见性。
+
+        匹配规则：叶子节点的 name 和 url 中包含关键词（不区分大小写），
+        则该叶子节点及其所有祖先节点可见，其余隐藏。
+
+        Args:
+            keyword: 搜索关键词；None 表示显示全部。
+        """
+        self._res_tree.blockSignals(True)
+
+        if keyword is None:
+            # 显示全部
+            it = QTreeWidgetItemIterator(self._res_tree)
+            while it.value():
+                it.value().setHidden(False)
+                it += 1
+        else:
+            # 先全部隐藏，再标记匹配的节点
+            matched_ancestors: set = set()
+            it = QTreeWidgetItemIterator(self._res_tree)
+            while it.value():
+                item = it.value()
+                r: Optional[Resource] = item.data(0, Qt.UserRole)
+                if r is not None:
+                    # 叶子节点：检查是否匹配
+                    if (keyword in r.name.lower() or keyword in r.url.lower()):
+                        item.setHidden(False)
+                        # 标记所有祖先可见
+                        p = item.parent()
+                        while p is not None:
+                            matched_ancestors.add(id(p))
+                            p = p.parent()
+                    else:
+                        item.setHidden(True)
+                it += 1
+
+            # 设置祖先节点可见性
+            it = QTreeWidgetItemIterator(self._res_tree)
+            while it.value():
+                item = it.value()
+                if item.data(0, Qt.UserRole) is None:
+                    # 文件夹节点
+                    item.setHidden(id(item) not in matched_ancestors)
+                    if id(item) in matched_ancestors:
+                        item.setExpanded(True)
+                it += 1
+
+        self._res_tree.blockSignals(False)
+
     def _on_select_all(self) -> None:
         """全选资源树中的所有叶子节点。"""
         self._res_tree.blockSignals(True)
@@ -823,13 +900,16 @@ class MainWindow(QMainWindow):
     def _update_count(self) -> None:
         """更新「已选 N 项」标签。"""
         checked = 0
+        total_leaves = 0
         it = QTreeWidgetItemIterator(self._res_tree)
         while it.value():
             item = it.value()
-            if id(item) in self._leaf_to_resource and item.checkState(0) == Qt.Checked:
-                checked += 1
+            if id(item) in self._leaf_to_resource:
+                total_leaves += 1
+                if item.checkState(0) == Qt.Checked:
+                    checked += 1
             it += 1
-        self._count_label.setText(f"已选 {checked} 项")
+        self._count_label.setText(f"已选 {checked}/{total_leaves} 项")
 
     def _on_preview(self, item: QTreeWidgetItem, column: int) -> None:
         """点击资源树项：右侧面板显示详细信息 + 内嵌预览。
@@ -943,6 +1023,73 @@ class MainWindow(QMainWindow):
         else:
             self._preview_image.setText("❌ 图片加载失败")
 
+    # ── 右键菜单 ─────────────────────────────────────────────
+
+    def _on_tree_context_menu(self, pos) -> None:
+        """资源树右键菜单：复制 URL、在浏览器打开、勾选/取消选中项。"""
+        from PyQt5.QtWidgets import QMenu
+        from PyQt5.QtGui import QClipboard
+
+        item: Optional[QTreeWidgetItem] = self._res_tree.itemAt(pos)
+        menu = QMenu(self)
+
+        if item is not None:
+            r: Optional[Resource] = item.data(0, Qt.UserRole)
+
+            if r is not None:
+                # 叶子节点菜单
+                copy_url_act = menu.addAction("📋 复制 URL")
+                copy_url_act.triggered.connect(lambda: self._copy_resource_url(r))
+
+                open_browser_act = menu.addAction("🌐 在浏览器打开")
+                open_browser_act.triggered.connect(lambda: self._open_in_browser(r.url))
+
+                copy_name_act = menu.addAction("📝 复制文件名")
+                copy_name_act.triggered.connect(lambda: self._copy_text(r.name))
+
+                menu.addSeparator()
+
+            # 对所有节点（含文件夹）通用
+            check_act = menu.addAction("✅ 勾选此项及子项")
+            check_act.triggered.connect(lambda: self._set_item_check(item, Qt.Checked))
+            uncheck_act = menu.addAction("❌ 取消勾选")
+            uncheck_act.triggered.connect(lambda: self._set_item_check(item, Qt.Unchecked))
+
+        menu.addSeparator()
+        menu.addAction("✅ 全选", self._on_select_all)
+        menu.addAction("❌ 全不选", self._on_select_none)
+
+        menu.exec_(self._res_tree.viewport().mapToGlobal(pos))
+
+    def _copy_resource_url(self, r: Resource) -> None:
+        """复制资源 URL 到剪贴板。"""
+        from PyQt5.QtWidgets import QApplication
+        clipboard: QClipboard = QApplication.clipboard()
+        clipboard.setText(r.url)
+        self._status_label.setText(f"📋 已复制: {r.url[:60]}")
+
+    def _copy_text(self, text: str) -> None:
+        """复制文本到剪贴板。"""
+        from PyQt5.QtWidgets import QApplication
+        clipboard: QClipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        self._status_label.setText(f"📋 已复制: {text[:60]}")
+
+    def _open_in_browser(self, url: str) -> None:
+        """在系统默认浏览器中打开 URL。"""
+        import webbrowser
+        webbrowser.open(url)
+
+    def _set_item_check(self, item: QTreeWidgetItem, state) -> None:
+        """设置节点及所有子节点的勾选状态。"""
+        self._res_tree.blockSignals(True)
+        item.setCheckState(0, state)
+        for i in range(item.childCount()):
+            item.child(i).setCheckState(0, state)
+        self._update_parent_check(item)
+        self._res_tree.blockSignals(False)
+        self._update_count()
+
     # ── 下载流程 ─────────────────────────────────────────────
 
     def _get_checked_resources(self) -> List[Resource]:
@@ -975,6 +1122,11 @@ class MainWindow(QMainWindow):
         self._stop_flag.clear()
         self._status_label.setText("\U0001f4fb 开始下载...")
         self._dl_list.clear()
+
+        # 重置速度追踪
+        self._dl_start_time = time.monotonic()
+        self._dl_last_done = 0
+        self._dl_last_time = time.monotonic()
 
         # 禁用抓取/下载按钮，启用停止按钮
         self._fetch_btn.setEnabled(False)
@@ -1022,6 +1174,25 @@ class MainWindow(QMainWindow):
         """
         self._progress.setValue(pct)
 
+        # 计算下载速度
+        now = time.monotonic()
+        speed_text = ""
+        elapsed = now - self._dl_last_time
+        if elapsed >= 0.5:  # 每 0.5 秒更新一次速度
+            delta_done = done - self._dl_last_done
+            if delta_done > 0:
+                # 估算：已完成项数 / 时间 = 项/秒
+                items_per_sec = delta_done / elapsed
+                # 估算总耗时
+                if done > 0 and done < total:
+                    remaining = (total - done) / items_per_sec if items_per_sec > 0 else 0
+                    if remaining < 60:
+                        speed_text = f" | 剩余 {remaining:.0f}s"
+                    else:
+                        speed_text = f" | 剩余 {remaining/60:.1f}min"
+            self._dl_last_done = done
+            self._dl_last_time = now
+
         # 从回调 name 中提取纯净文件名（去掉 OK:/跳过:/HLS: 等前缀和大小后缀）
         clean_name = name
         for prefix in ("OK: ", "跳过: ", "HLS: ", "分片 ", "合并中...", "转封装中...", "嵌入字幕: "):
@@ -1057,9 +1228,9 @@ class MainWindow(QMainWindow):
         if self._global_item is not None:
             total_pct: int = int(done / total * 100) if total else 0
             self._global_item.setText(
-                f"总进度: [{done}/{total}] {total_pct}% — {name[:25]}"
+                f"总进度: [{done}/{total}] {total_pct}%{speed_text} — {name[:25]}"
             )
-        self._status_label.setText(f"\U0001f4e5 [{done}/{total}] {name[:30]}")
+        self._status_label.setText(f"\U0001f4e5 [{done}/{total}]{speed_text} {name[:30]}")
 
     def _on_download_done(
         self,
@@ -1174,6 +1345,8 @@ class MainWindow(QMainWindow):
 
     def _on_stop_download(self) -> None:
         """点击「停止」按钮：设置停止标志通知 Worker 中止。"""
+        if not self._downloading:
+            return
         self._stop_flag.set()
         self._status_label.setText("\u23f9 正在停止...")
 
@@ -1318,6 +1491,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+D"), self, self._on_download)
         # Escape: 停止下载
         QShortcut(QKeySequence("Escape"), self, self._on_stop_download)
+        # Ctrl+F: 聚焦搜索框
+        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self._search_input.setFocus())
 
     # ── 关闭窗口确认 ──────────────────────────────────────────
 
