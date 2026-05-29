@@ -7,7 +7,7 @@
 from typing import Final
 
 # ── 版本号 ─────────────────────────────────────────────
-APP_VERSION: Final[str] = "1.1.5"
+APP_VERSION: Final[str] = "1.1.6"
 APP_NAME: Final[str] = "Web Resource Crawler"
 
 # ── HTTP 请求 ──────────────────────────────────────────

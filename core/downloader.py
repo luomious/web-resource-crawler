@@ -421,56 +421,79 @@ def download_file(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     own_session = session is None
-    if own_session:
-        session = _make_session()
+    max_retries: int = 3
+    last_err: str = ''
 
-    try:
-        # 断点续传：检查已有文件大小
-        existing_size: int = 0
-        headers = _headers(url)
-        if output.exists():
-            existing_size = output.stat().st_size
-            if existing_size > 0:
-                headers['Range'] = f'bytes={existing_size}-'
+    for attempt in range(max_retries):
+        if stop_flag and stop_flag.is_set():
+            return '', STOPPED_MARKER
 
-        r = session.get(
-            url,
-            headers=headers,
-            timeout=(CONNECT_TIMEOUT, TIMEOUT),
-            stream=True,
-        )
-        if r is None:
-            _log.warning(f'[download] {url[:60]} 返回 None 响应')
-            return '', '服务器返回空响应'
-
-        # 服务器不支持 Range 或返回 200（完整文件）→ 重新下载
-        if r.status_code == 200:
-            existing_size = 0
-            mode = 'wb'
-        elif r.status_code == 206:
-            mode = 'ab'
-            _log.info(f'[download] 断点续传 {output.name} 从 {existing_size} 字节继续')
-        else:
-            r.raise_for_status()
-            mode = 'wb'
-
-        with open(output, mode) as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                if stop_flag and stop_flag.is_set():
-                    r.close()
-                    return '', STOPPED_MARKER
-                if chunk:
-                    f.write(chunk)
-        return str(output), ''
-
-    except Exception as e:
-        _log.warning(f'[download] {url[:60]} 下载失败: {e}')
-        if output.exists() and output.stat().st_size < 1024:
-            output.unlink(missing_ok=True)
-        return '', str(e)
-    finally:
+        sess = session
         if own_session:
-            session.close()
+            sess = _make_session()
+
+        try:
+            # 断点续传：检查已有文件大小
+            existing_size: int = 0
+            headers = _headers(url)
+            if output.exists():
+                existing_size = output.stat().st_size
+                if existing_size > 0:
+                    headers['Range'] = f'bytes={existing_size}-'
+
+            r = sess.get(
+                url,
+                headers=headers,
+                timeout=(CONNECT_TIMEOUT, TIMEOUT),
+                stream=True,
+            )
+            if r is None:
+                _log.warning(f'[download] {url[:60]} 返回 None 响应 (尝试 {attempt+1}/{max_retries})')
+                last_err = '服务器返回空响应'
+                continue
+
+            # 服务器不支持 Range 或返回 200（完整文件）→ 重新下载
+            if r.status_code == 200:
+                existing_size = 0
+                mode = 'wb'
+            elif r.status_code == 206:
+                mode = 'ab'
+                _log.info(f'[download] 断点续传 {output.name} 从 {existing_size} 字节继续')
+            else:
+                r.raise_for_status()
+                mode = 'wb'
+
+            with open(output, mode) as f:
+                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    if stop_flag and stop_flag.is_set():
+                        r.close()
+                        if own_session:
+                            sess.close()
+                        return '', STOPPED_MARKER
+                    if chunk:
+                        f.write(chunk)
+            if own_session:
+                sess.close()
+            return str(output), ''
+
+        except Exception as e:
+            last_err = str(e)
+            _log.warning(f'[download] {url[:60]} 下载失败 (尝试 {attempt+1}/{max_retries}): {e}')
+            if attempt < max_retries - 1:
+                import time as _time
+                _time.sleep(1.0 * (attempt + 1))  # 指数退避: 1s, 2s
+        finally:
+            if own_session and 'sess' in dir():
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+    # 全部重试失败
+    _log.error(f'[download] {url[:60]} 重试{max_retries}次均失败: {last_err}')
+    if output.exists() and output.stat().st_size < 1024:
+        output.unlink(missing_ok=True)
+    return '', last_err
 
 
 # ---- HLS 流媒体 ------------------------------------------------
@@ -546,7 +569,7 @@ def download_hls(
         def _thread_session() -> requests.Session:
             s = getattr(thread_local, 'session', None)
             if s is None:
-                s = _make_session(pool_connections=8, pool_maxsize=workers)
+                s = _make_session(pool_connections=max(16, workers), pool_maxsize=workers * 2)
                 thread_local.session = s
                 with sessions_lock:
                     sessions.append(s)
@@ -561,35 +584,44 @@ def download_hls(
             if seg_path.exists() and seg_path.stat().st_size > 0:
                 return idx, True
 
-            sess = _thread_session()
-            try:
-                r = sess.get(
-                    url,
-                    headers=_headers(url),
-                    timeout=(CONNECT_TIMEOUT, 15),
-                )
-                if r is None:
-                    _log.warning(f'[HLS] 分片 {idx} 返回 None 响应')
+            # HLS 分片重试（2次）
+            for hls_attempt in range(3):
+                if stop_flag and stop_flag.is_set():
                     return idx, False
-                r.raise_for_status()
+                sess = _thread_session()
+                try:
+                    r = sess.get(
+                        url,
+                        headers=_headers(url),
+                        timeout=(CONNECT_TIMEOUT, 15),
+                    )
+                    if r is None:
+                        _log.warning(f'[HLS] 分片 {idx} 返回 None (尝试 {hls_attempt+1}/3)')
+                        continue
+                    r.raise_for_status()
 
-                content_length = int(r.headers.get('Content-Length', 0))
-                if content_length > 0 and content_length <= 2 * CHUNK_SIZE:
-                    with open(seg_path, 'wb') as f:
-                        f.write(r.content)
-                else:
-                    with open(seg_path, 'wb') as f:
-                        for c in r.iter_content(chunk_size=CHUNK_SIZE):
-                            if stop_flag and stop_flag.is_set():
-                                r.close()
-                                return idx, False
-                            if c:
-                                f.write(c)
-                return idx, True
+                    content_length = int(r.headers.get('Content-Length', 0))
+                    if content_length > 0 and content_length <= 2 * CHUNK_SIZE:
+                        with open(seg_path, 'wb') as f:
+                            f.write(r.content)
+                    else:
+                        with open(seg_path, 'wb') as f:
+                            for c in r.iter_content(chunk_size=CHUNK_SIZE):
+                                if stop_flag and stop_flag.is_set():
+                                    r.close()
+                                    return idx, False
+                                if c:
+                                    f.write(c)
+                    return idx, True
 
-            except Exception as exc:
-                _log.warning(f'[HLS] 分片 {idx} 失败: {exc}')
-                return idx, False
+                except Exception as exc:
+                    _log.warning(f'[HLS] 分片 {idx} 失败 (尝试 {hls_attempt+1}/3): {exc}')
+                    if hls_attempt < 2:
+                        import time as _time
+                        _time.sleep(0.5 * (hls_attempt + 1))
+
+            _log.error(f'[HLS] 分片 {idx} 重试3次均失败')
+            return idx, False
 
         seg_args: list[tuple[int, str]] = list(enumerate(segments))
         try:
@@ -695,7 +727,7 @@ def download_all(
         else:
             normal_items.append((i, r))
 
-    shared_session = _make_session(pool_connections=workers, pool_maxsize=workers * 2)
+    shared_session = _make_session(pool_connections=workers * 2, pool_maxsize=workers * 4)
 
     def _inc_done() -> int:
         with counter['lock']:
