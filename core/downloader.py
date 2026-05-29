@@ -38,6 +38,9 @@ from core.constants import (
     DOWNLOAD_CHUNK_SIZE as CHUNK_SIZE,
     DEFAULT_USER_AGENT as _USER_AGENT,
     STOPPED_MARKER,
+    AUDIO_EXTS as _AUDIO_EXTS,
+    VIDEO_EXTS as _VIDEO_EXTS,
+    SUBTITLE_EXTS as _SUBTITLE_EXTS,
 )
 from core.config import get_proxy
 
@@ -223,6 +226,120 @@ def _remux_with_ffmpeg(
         _log.warning(f'[ffmpeg] 转封装异常: {e}')
         output_path.unlink(missing_ok=True)
         return False
+
+
+def _embed_subtitle(
+    media_path: Path,
+    sub_path: Path,
+    stop_flag: Optional[threading.Event] = None,
+) -> bool:
+    """使用 ffmpeg 将字幕软嵌入音视频文件（不重编码）。\n\n    将字幕作为软字幕轨道 mux 到容器中，视频/音频流不变（-c copy）。\n    输出文件与源文件同目录，扩展名保持不变，成功后删除原始文件。\n\n    Args:\n        media_path: 音视频文件路径。\n        sub_path: 字幕文件路径。\n        stop_flag: 停止信号。\n\n    Returns:\n        True 嵌入成功，False 失败或 ffmpeg 不可用。\n    """
+    if not _ffmpeg_available():
+        return False
+
+    import subprocess
+
+    # 输出临时文件
+    tmp_path: Path = media_path.with_suffix(media_path.suffix + '.tmp')
+
+    try:
+        # 字幕编码：SRT/VTT 默认按 UTF-8 读取，ASS/SSA 也兼容
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(media_path),
+            '-i', str(sub_path),
+            '-c', 'copy',
+            '-c:s', 'mov_text',       # MP4 容器用 mov_text（兼容性最好）
+            '-disposition:s:0', 'default',
+            str(tmp_path),
+        ]
+
+        # MKV 容器可以保留 ASS 原始格式
+        if media_path.suffix.lower() == '.mkv':
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', str(media_path),
+                '-i', str(sub_path),
+                '-c', 'copy',
+                '-c:s', 'ass',
+                '-disposition:s:0', 'default',
+                str(tmp_path),
+            ]
+
+        if stop_flag and stop_flag.is_set():
+            return False
+
+        result = subprocess.run(
+            cmd,
+            timeout=180,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+
+        if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+            # 成功：替换原文件，删除字幕文件
+            tmp_path.replace(media_path)
+            sub_path.unlink(missing_ok=True)
+            _log.info(f'[字幕嵌入] {media_path.name} ← {sub_path.name} 成功')
+            return True
+        else:
+            stderr_text: str = result.stderr.decode('utf-8', errors='replace')[:300]
+            _log.warning(f'[字幕嵌入] 失败: {stderr_text}')
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+    except subprocess.TimeoutExpired:
+        _log.warning('[字幕嵌入] ffmpeg 超时')
+        tmp_path.unlink(missing_ok=True)
+        return False
+    except Exception as e:
+        _log.warning(f'[字幕嵌入] 异常: {e}')
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
+def embed_subtitles(save_dir: Path, stop_flag: Optional[threading.Event] = None) -> list[str]:
+    """扫描已下载目录，将匹配的字幕文件嵌入对应的音视频文件。\n\n    匹配规则：字幕文件名（去扩展名）与音视频文件名（去扩展名）相同，\n    或者字幕文件名是音视频文件名的前缀。\n\n    Args:\n        save_dir: 下载保存目录。\n        stop_flag: 停止信号。\n\n    Returns:\n        嵌入成功的文件名列表。\n    """
+    if not _ffmpeg_available():
+        _log.info('[字幕嵌入] ffmpeg 不可用，跳过')
+        return []
+
+    # 收集音视频和字幕文件（递归子目录）
+    media_files: dict[str, Path] = {}    # stem → Path
+    sub_files: dict[str, Path] = {}      # stem → Path
+
+    for f in save_dir.rglob('*'):
+        if not f.is_file():
+            continue
+        ext: str = f.suffix.lower()
+        if ext in _VIDEO_EXTS or ext in {'.m4a', '.mkv'}:
+            media_files[f.stem] = f
+        elif ext in _SUBTITLE_EXTS:
+            sub_files[f.stem] = f
+
+    if not sub_files:
+        return []
+
+    embedded: list[str] = []
+
+    for sub_stem, sub_path in sub_files.items():
+        if stop_flag and stop_flag.is_set():
+            break
+
+        # 精确匹配：字幕 stem == 音视频 stem
+        if sub_stem in media_files:
+            if _embed_subtitle(media_files[sub_stem], sub_path, stop_flag):
+                embedded.append(media_files[sub_stem].name)
+            continue
+
+        # 前缀匹配：字幕 stem 是某个音视频 stem 的一部分（如 "video.zh" 匹配 "video"）
+        for media_stem, media_path in media_files.items():
+            if sub_stem.startswith(media_stem + '.') or sub_stem.startswith(media_stem + '_'):
+                if _embed_subtitle(media_path, sub_path, stop_flag):
+                    embedded.append(media_path.name)
+                break
+
+    return embedded
 
 
 # ---- 普通文件下载 ------------------------------------------------
@@ -611,6 +728,16 @@ def download_all(
 
     finally:
         shared_session.close()
+
+    # 下载完成后：扫描字幕文件并嵌入对应音视频
+    if not (stop_flag and stop_flag.is_set()):
+        try:
+            embedded = embed_subtitles(save_dir, stop_flag)
+            if embedded and progress_cb:
+                for name in embedded:
+                    _log.info(f'[字幕嵌入] {name} 已嵌入字幕')
+        except Exception as e:
+            _log.warning(f'[字幕嵌入] 后处理异常: {e}')
 
     return [
         results_dict.get(i, (resources[i].url, '未完成'))

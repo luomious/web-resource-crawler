@@ -19,6 +19,7 @@ from core.constants import (
     DOC_EXTS,
     CSS_EXTS,
     JS_EXTS,
+    SUBTITLE_EXTS,
 )
 from core.unpacker import extract_m3u8_from_html
 
@@ -95,6 +96,9 @@ def classify(url: str, candidate_type: str = "") -> str:
     for ext in DOC_EXTS:
         if ext in lower:
             return "文档"
+    for ext in SUBTITLE_EXTS:
+        if ext in lower:
+            return "字幕"
     return candidate_type or "其他"
 
 

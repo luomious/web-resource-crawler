@@ -37,6 +37,7 @@ VIDEO_EXTS: Final[set[str]] = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".flv", 
 DOC_EXTS: Final[set[str]] = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".7z"}
 CSS_EXTS: Final[set[str]] = {".css"}
 JS_EXTS: Final[set[str]] = {".js"}
+SUBTITLE_EXTS: Final[set[str]] = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".lrc"}
 
 # ── 下载器 ────────────────────────────────────────────
 CHUNK_SIZE: Final[int] = 65536              # scraper 侧
