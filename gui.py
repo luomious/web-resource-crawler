@@ -251,10 +251,16 @@ class MainWindow(QMainWindow):
         """初始化主窗口，加载配置、构建 UI、应用主题。"""
         super().__init__()
         self.setWindowTitle("网页资源爬虫")
-        self.setGeometry(100, 100, 1200, 800)
 
         # 加载配置
         cfg: dict = load_config()
+
+        # 恢复窗口位置/大小
+        geo = cfg.get("window_geometry")
+        if geo and isinstance(geo, str):
+            self.restoreGeometry(bytes.fromhex(geo))
+        else:
+            self.setGeometry(100, 100, 1200, 800)
 
         # 状态变量
         self.resources: List[Resource] = []
@@ -838,9 +844,12 @@ class MainWindow(QMainWindow):
             item: 被点击的 QTreeWidgetItem。
             column: 点击的列号。
         """
-        # 停止上一次播放
+        # 停止上一次播放 / 取消图片加载
         if self._media_player:
             self._media_player.stop()
+        if self._img_worker is not None and self._img_worker.isRunning():
+            self._img_worker.quit()
+            self._img_worker.wait(300)
         self._preview_image.hide()
         if self._video_widget:
             self._video_widget.hide()
@@ -1092,6 +1101,22 @@ class MainWindow(QMainWindow):
             f"\u2705 完成: 成功 {len(ok_list)}, 失败 {len(fail_list)}"
         )
 
+        # 下载成功后自动取消对应资源的勾选，避免重复下载
+        if ok_list:
+            ok_urls = {url for url, _, _ in ok_list}
+            self._res_tree.blockSignals(True)
+            it = QTreeWidgetItemIterator(self._res_tree)
+            while it.value():
+                item = it.value()
+                if id(item) in self._leaf_to_resource:
+                    r = item.data(0, Qt.UserRole)
+                    if r is not None and r.url in ok_urls:
+                        item.setCheckState(0, Qt.Unchecked)
+                it += 1
+            self._sync_all_folder_checks()
+            self._res_tree.blockSignals(False)
+            self._update_count()
+
         # 系统托盘通知（窗口最小化时特别有用）
         self._show_tray_notification(len(ok_list), len(fail_list))
 
@@ -1297,7 +1322,7 @@ class MainWindow(QMainWindow):
     # ── 关闭窗口确认 ──────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-        """关闭窗口时：若正在下载，弹出确认对话框。"""
+        """关闭窗口时：若正在下载，弹出确认对话框；否则保存窗口位置。"""
         if self._downloading:
             reply = QMessageBox.question(
                 self, "确认关闭",
@@ -1320,6 +1345,15 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 event.ignore()
                 return
+
+        # 保存窗口位置/大小
+        try:
+            cfg = load_config()
+            cfg["window_geometry"] = self.saveGeometry().hex()
+            save_config(cfg)
+        except Exception:
+            pass
+
         event.accept()
 
 
