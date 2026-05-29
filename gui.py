@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
                 type_node = QTreeWidgetItem(self._res_tree, [type_label, ""])
                 type_node.setData(0, Qt.UserRole, None)
                 type_node.setCheckState(0, Qt.Unchecked)
-                type_node.setExpanded(True)
+                type_node.setExpanded(False)
                 folder_nodes[type_key] = type_node
 
             # ── 2. 类型下的子结构 ──
@@ -542,7 +542,7 @@ class MainWindow(QMainWindow):
                     domain_item = QTreeWidgetItem(type_node, [f"📄 {domain}", ""])
                     domain_item.setData(0, Qt.UserRole, None)
                     domain_item.setCheckState(0, Qt.Unchecked)
-                    domain_item.setExpanded(True)
+                    domain_item.setExpanded(False)
                     folder_nodes[source_key] = domain_item
                     parent = domain_item
                 else:
@@ -564,7 +564,7 @@ class MainWindow(QMainWindow):
                         folder_item = QTreeWidgetItem(parent, [f"📁 {part}", ""])
                         folder_item.setData(0, Qt.UserRole, None)
                         folder_item.setCheckState(0, Qt.Unchecked)
-                        folder_item.setExpanded(True)
+                        folder_item.setExpanded(False)
                         folder_nodes[path_so_far] = folder_item
                         parent = folder_item
 
