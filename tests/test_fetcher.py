@@ -36,8 +36,8 @@ class TestMakeSession:
 class TestFetchHtml:
     """fetch_html 测试"""
 
-    @patch("core.fetcher.make_session")
-    def test_returns_html_string(self, mock_make_session):
+    @patch("core.fetcher.get_shared_session")
+    def test_returns_html_string(self, mock_get_session):
         """正常请求返回 HTML 字符串"""
         mock_session = MagicMock()
         mock_resp = MagicMock()
@@ -46,21 +46,20 @@ class TestFetchHtml:
         mock_resp.apparent_encoding = "utf-8"
         mock_resp.raise_for_status = MagicMock()
         mock_session.get.return_value = mock_resp
-        mock_make_session.return_value = mock_session
+        mock_get_session.return_value = mock_session
 
         result = fetch_html("https://example.com")
         assert "Hello" in result
-        mock_session.close.assert_called_once()
 
-    @patch("core.fetcher.make_session")
-    def test_asmr_one_returns_empty(self, mock_make_session):
+    @patch("core.fetcher.get_shared_session")
+    def test_asmr_one_returns_empty(self, mock_get_session):
         """asmr.one URL 不请求 HTML，直接返回空字符串"""
         result = fetch_html("https://asmr.one/work/RJ01000000")
         assert result == ""
-        mock_make_session.assert_not_called()
+        mock_get_session.assert_not_called()
 
-    @patch("core.fetcher.make_session")
-    def test_gbk_encoding_auto_decode(self, mock_make_session):
+    @patch("core.fetcher.get_shared_session")
+    def test_gbk_encoding_auto_decode(self, mock_get_session):
         """GBK 编码页面自动解码"""
         html_gbk = "<html><body>中文内容</body></html>".encode("gbk")
 
@@ -71,7 +70,7 @@ class TestFetchHtml:
         mock_resp.apparent_encoding = "gbk"
         mock_resp.raise_for_status = MagicMock()
         mock_session.get.return_value = mock_resp
-        mock_make_session.return_value = mock_session
+        mock_get_session.return_value = mock_session
 
         result = fetch_html("https://example.com/gbk-page")
         assert "中文内容" in result

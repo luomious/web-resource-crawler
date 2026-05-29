@@ -35,7 +35,7 @@ from core.constants import (
     MAX_DOWNLOAD_WORKERS as MAX_WORKERS,
     HLS_DOWNLOAD_WORKERS,
     HLS_DOWNLOAD_WORKER_LIMIT,
-    DOWNLOAD_CHUNK_SIZE as CHUNK_SIZE,
+    DOWNLOAD_CHUNK_SIZE,
     DEFAULT_USER_AGENT as _USER_AGENT,
     STOPPED_MARKER,
     AUDIO_EXTS as _AUDIO_EXTS,
@@ -464,7 +464,7 @@ def download_file(
                 mode = 'wb'
 
             with open(output, mode) as f:
-                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     if stop_flag and stop_flag.is_set():
                         r.close()
                         if own_session:
@@ -601,12 +601,12 @@ def download_hls(
                     r.raise_for_status()
 
                     content_length = int(r.headers.get('Content-Length', 0))
-                    if content_length > 0 and content_length <= 2 * CHUNK_SIZE:
+                    if content_length > 0 and content_length <= 2 * DOWNLOAD_CHUNK_SIZE:
                         with open(seg_path, 'wb') as f:
                             f.write(r.content)
                     else:
                         with open(seg_path, 'wb') as f:
-                            for c in r.iter_content(chunk_size=CHUNK_SIZE):
+                            for c in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                                 if stop_flag and stop_flag.is_set():
                                     r.close()
                                     return idx, False

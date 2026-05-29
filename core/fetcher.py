@@ -24,6 +24,36 @@ from core.parser import parse_resources, Resource
 
 _log = logging.getLogger("fetcher")
 
+# ---- 模块级共享 Session（线程安全）----
+_shared_session: Optional[requests.Session] = None
+_session_lock = __import__("threading").Lock()
+
+
+def get_shared_session() -> requests.Session:
+    """获取模块级共享 Session（懒创建，线程安全）。
+
+    复用连接池，避免每次 fetch_html 都重新创建 Session。
+    代理变更时调用 reset_shared_session() 重建。
+    """
+    global _shared_session
+    if _shared_session is None:
+        with _session_lock:
+            if _shared_session is None:
+                _shared_session = make_session()
+    return _shared_session
+
+
+def reset_shared_session() -> None:
+    """关闭并重建共享 Session（代理变更后调用）。"""
+    global _shared_session
+    with _session_lock:
+        if _shared_session is not None:
+            try:
+                _shared_session.close()
+            except Exception:
+                pass
+            _shared_session = None
+
 
 def make_session() -> requests.Session:
     """创建带重试策略和连接池复用的 Session。
@@ -78,7 +108,7 @@ def fetch_html(url: str) -> str:
     if is_asmr_one(url):
         return ""  # asmr.one 走 API，不需要 HTML
 
-    s = make_session()
+    s = get_shared_session()
     try:
         headers = {
             "User-Agent": USER_AGENTS[0],
@@ -102,12 +132,8 @@ def fetch_html(url: str) -> str:
             except (UnicodeDecodeError, LookupError):
                 html = resp.content.decode("utf-8", errors="replace")
         return html
-    finally:
-        if s is not None:
-            try:
-                s.close()
-            except Exception:
-                pass
+    except Exception:
+        raise
 
 
 def fetch_all_urls(urls: list[str], max_workers: int = MAX_FETCH_WORKERS) -> list[Resource]:

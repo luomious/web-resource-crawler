@@ -1164,11 +1164,13 @@ class MainWindow(QMainWindow):
         self._proxy_timer.start(500)
 
     def _on_proxy_changed(self) -> None:
-        """代理输入防抖回调：保存到配置。"""
+        """代理输入防抖回调：保存到配置 + 重置共享 Session。"""
+        from core.fetcher import reset_shared_session
         text = self._proxy_input.text()
         cfg = load_config()
         cfg["proxy"] = text.strip()
         save_config(cfg)
+        reset_shared_session()
         if text.strip():
             self._status_label.setText(f"\U0001f310 代理已设置: {text.strip()}")
         else:
