@@ -77,6 +77,9 @@ def parse_asmr_one(url: str) -> list:
             headers={"User-Agent": USER_AGENTS[0]},
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
         )
+        if info_r is None:
+            _log.warning(f"[asmr.one] 作品信息返回 None 响应: {rj}")
+            return []
         info_r.raise_for_status()
         work_id = info_r.json().get("id")
         if not work_id:
@@ -89,6 +92,9 @@ def parse_asmr_one(url: str) -> list:
             headers={"User-Agent": USER_AGENTS[0]},
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
         )
+        if tracks_r is None:
+            _log.warning(f"[asmr.one] 文件树返回 None 响应: {work_id}")
+            return []
         tracks_r.raise_for_status()
         tree = tracks_r.json()
 

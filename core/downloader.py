@@ -394,6 +394,9 @@ def download_file(
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
             stream=True,
         )
+        if r is None:
+            _log.warning(f'[download] {url[:60]} 返回 None 响应')
+            return '', '服务器返回空响应'
 
         # 服务器不支持 Range 或返回 200（完整文件）→ 重新下载
         if r.status_code == 200:
@@ -439,6 +442,9 @@ def _parse_m3u8(m3u8_url: str, session: Optional[requests.Session] = None) -> li
             headers=_headers(),
             timeout=(CONNECT_TIMEOUT, TIMEOUT),
         )
+        if r is None:
+            _log.warning(f'[m3u8] {m3u8_url[:60]} 返回 None 响应')
+            return []
         r.raise_for_status()
         lines = [
             l.strip() for l in r.text.splitlines()
@@ -517,6 +523,9 @@ def download_hls(
                     headers=_headers(url),
                     timeout=(CONNECT_TIMEOUT, 15),
                 )
+                if r is None:
+                    _log.warning(f'[HLS] 分片 {idx} 返回 None 响应')
+                    return idx, False
                 r.raise_for_status()
 
                 content_length = int(r.headers.get('Content-Length', 0))

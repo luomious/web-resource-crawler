@@ -1280,19 +1280,25 @@ if __name__ == "__main__":
     # 全局异常钩子：将未捕获异常完整 traceback 写入日志文件
     _orig_excepthook = sys.excepthook
 
+    # 日志路径：exe 同目录（PyInstaller --windowed 下 Path.home() 可能异常）
+    if getattr(sys, 'frozen', False):
+        _log_dir = Path(sys.executable).parent
+    else:
+        _log_dir = Path.cwd()
+    _crash_log = _log_dir / "web_crawler_crash.log"
+
     def _global_excepthook(exc_type, exc_value, exc_tb):
         import traceback as _tb
         tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
-        # 写入日志文件
-        log_path = Path.home() / "web_crawler_crash.log"
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                import datetime as _dt
-                f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{tb_text}")
-        except Exception:
-            pass
-        # 也打印到 stderr
-        _orig_excepthook(exc_type, exc_value, exc_tb)
+        # 写入日志文件（多路径尝试）
+        for log_path in [_crash_log, Path.home() / "web_crawler_crash.log", Path.cwd() / "web_crawler_crash.log"]:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    import datetime as _dt
+                    f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{tb_text}")
+                break  # 写成功就停
+            except Exception:
+                continue
         # 尝试弹窗显示完整错误
         try:
             if QApplication.instance() is None:
@@ -1300,6 +1306,8 @@ if __name__ == "__main__":
             QMessageBox.critical(None, "错误", f"未捕获异常:\n\n{tb_text[:2000]}")
         except Exception:
             pass
+        # 最后才调原始钩子（PyInstaller --windowed 可能直接退出）
+        _orig_excepthook(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _global_excepthook
 
@@ -1307,13 +1315,14 @@ if __name__ == "__main__":
     def _qthread_excepthook(exc_type, exc_value, exc_tb):
         import traceback as _tb
         tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
-        log_path = Path.home() / "web_crawler_crash.log"
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                import datetime as _dt
-                f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S} [QThread]\n{tb_text}")
-        except Exception:
-            pass
+        for log_path in [_crash_log, Path.home() / "web_crawler_crash.log", Path.cwd() / "web_crawler_crash.log"]:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    import datetime as _dt
+                    f.write(f"\n{'='*60}\n{_dt.datetime.now():%Y-%m-%d %H:%M:%S} [QThread]\n{tb_text}")
+                break
+            except Exception:
+                continue
 
     # PyQt5 QThread 的 uncaught exception 默认走 sys.excepthook
     # 但 --windowed 模式下 PyInstaller 覆盖了 sys.excepthook，所以需要恢复
