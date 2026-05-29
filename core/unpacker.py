@@ -8,7 +8,6 @@ import re
 import logging
 from typing import Optional
 
-from core.constants import CHUNK_SIZE
 
 _log = logging.getLogger("unpacker")
 

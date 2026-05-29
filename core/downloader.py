@@ -42,7 +42,8 @@ from core.constants import (
     VIDEO_EXTS as _VIDEO_EXTS,
     SUBTITLE_EXTS as _SUBTITLE_EXTS,
 )
-from core.config import get_proxy
+
+from core.fetcher import make_session as _fetcher_make_session
 
 _log = logging.getLogger('downloader')
 
@@ -53,8 +54,12 @@ _RETRY_TOTAL: int = 3
 
 
 def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> requests.Session:
-    """创建带 Retry 策略的 Session（连接池复用 + 代理）。"""
-    s = requests.Session()
+    """创建带 Retry 策略的 Session（连接池复用 + 代理）。
+
+    复用 fetcher.make_session 的代理/重试配置，仅覆盖连接池大小。
+    """
+    s = _fetcher_make_session()
+    # 覆盖连接池大小（downloader 需要更大的池）
     retry = Retry(
         total=_RETRY_TOTAL,
         connect=_RETRY_TOTAL,
@@ -70,12 +75,6 @@ def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> request
     )
     s.mount('https://', adapter)
     s.mount('http://', adapter)
-
-    # 代理
-    proxies = get_proxy()
-    if proxies:
-        s.proxies.update(proxies)
-
     return s
 
 
@@ -691,7 +690,7 @@ def download_all(
     normal_items: list[tuple[int, object]] = []
 
     for i, r in enumerate(resources):
-        if 'HLS' in getattr(r, 'rtype', '') or '.m3u8' in getattr(r, 'url', ''):
+        if 'HLS' in getattr(r, 'rtype', '') or getattr(r, 'url', '').lower().endswith('.m3u8'):
             hls_items.append((i, r))
         else:
             normal_items.append((i, r))

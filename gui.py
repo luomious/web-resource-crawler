@@ -385,7 +385,8 @@ class MainWindow(QMainWindow):
         url_layout.addLayout(input_row)
 
         dir_row: QHBoxLayout = QHBoxLayout()
-        dir_row.addWidget(QLabel(f"保存目录: {self._save_dir}"))
+        self._dir_label: QLabel = QLabel(f"保存目录: {self._save_dir}")
+        dir_row.addWidget(self._dir_label)
         change_dir_btn: QPushButton = QPushButton("\U0001f4c1 更换")
         change_dir_btn.clicked.connect(self._on_change_dir)
         dir_row.addWidget(change_dir_btn)
@@ -795,7 +796,7 @@ class MainWindow(QMainWindow):
 
     def _sync_all_folder_checks(self) -> None:
         """同步所有文件夹节点的勾选状态（从叶子向上传播）。"""
-        # 收集所有叶子，然后逐层更新父节点
+        # 收集所有叶子，逐层向上更新父节点
         leaves: List[QTreeWidgetItem] = []
         it = QTreeWidgetItemIterator(self._res_tree)
         while it.value():
@@ -804,12 +805,12 @@ class MainWindow(QMainWindow):
                 leaves.append(item)
             it += 1
 
-        # 从叶子向上递归更新
+        # 从每个叶子向上更新（_update_parent_check 内部已递归）
         updated_parents: set = set()
         for leaf in leaves:
             parent = leaf.parent()
             while parent is not None and id(parent) not in updated_parents:
-                self._update_parent_check(leaf)
+                self._update_parent_check(parent)
                 updated_parents.add(id(parent))
                 parent = parent.parent()
 
@@ -901,9 +902,15 @@ class MainWindow(QMainWindow):
     def _load_preview_image(self, url: str) -> None:
         """后台加载图片并显示到预览区。
 
+        先取消上一次加载线程，避免快速切换时多个线程同时运行。
+
         Args:
             url: 图片 URL。
         """
+        # 取消上一次加载
+        if self._img_worker is not None and self._img_worker.isRunning():
+            self._img_worker.quit()
+            self._img_worker.wait(500)
         self._img_worker = _ImageLoadWorker(url)
         self._img_worker.loaded.connect(self._on_preview_image_loaded)
         self._img_worker.failed.connect(lambda: self._preview_image.setText("❌ 图片加载失败"))
@@ -996,7 +1003,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         """下载进度回调：更新进度条和文件条目文本。
 
-        使用 URL 精确匹配下载条目，替代之前的文件名截取匹配。
+        匹配策略：从回调 name 中提取文件名部分，与 _dl_name_map 精确比对。
 
         Args:
             total: 资源总数。
@@ -1006,14 +1013,27 @@ class MainWindow(QMainWindow):
         """
         self._progress.setValue(pct)
 
-        # 尝试通过 URL 精确匹配条目
+        # 从回调 name 中提取纯净文件名（去掉 OK:/跳过:/HLS: 等前缀和大小后缀）
+        clean_name = name
+        for prefix in ("OK: ", "跳过: ", "HLS: ", "分片 ", "合并中...", "转封装中...", "嵌入字幕: "):
+            if clean_name.startswith(prefix):
+                clean_name = clean_name[len(prefix):]
+                break
+        # 去掉大小后缀，如 "xxx.mp4 (1.2MB)"
+        import re as _re
+        clean_name = _re.sub(r'\s*\([\d.]+[KM]B\)$', '', clean_name).strip()
+        # 去掉百分比后缀
+        clean_name = _re.sub(r'\s*\[\d+%\]$', '', clean_name).strip()
+
+        # 用文件名匹配下载条目
         matched: bool = False
         for url, item in list(self._dl_items.items()):
             display = self._dl_name_map.get(url, url)
-            # 进度回调的 name 包含文件名或 OK 信息，用 URL 片段匹配
-            if url in name or display[:20] in name or name[:20] in display:
+            # 精确匹配：display 以 clean_name 开头，或 clean_name 以 display 的文件名开头
+            display_file = display.split("/")[-1]  # 取最后一段（去掉路径）
+            if display_file and (display_file == clean_name or clean_name.startswith(display_file) or display_file.startswith(clean_name)):
                 prefix: str = "\u2705" if pct >= 100 else "\u2b07"
-                item.setText(f"{prefix} {display[:30]} [{pct}%]")
+                item.setText(f"{prefix} {display[:40]} [{pct}%]")
                 matched = True
                 break
 
@@ -1022,7 +1042,7 @@ class MainWindow(QMainWindow):
             for url, item in self._dl_items.items():
                 if "\u2b07" in item.text():
                     display = self._dl_name_map.get(url, url)
-                    item.setText(f"\u2b07 {display[:30]} [{pct}%]")
+                    item.setText(f"\u2b07 {display[:40]} [{pct}%]")
                     break
 
         if self._global_item is not None:
@@ -1131,6 +1151,7 @@ class MainWindow(QMainWindow):
             cfg: dict = load_config()
             cfg["save_dir"] = directory
             save_config(cfg)
+            self._dir_label.setText(f"保存目录: {directory}")
             self._status_label.setText(f"保存目录: {directory}")
 
     def _on_proxy_text_changed(self, text: str) -> None:
