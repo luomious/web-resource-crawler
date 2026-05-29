@@ -229,6 +229,44 @@ def _remux_with_ffmpeg(
         return False
 
 
+def _ensure_utf8_subtitle(sub_path):
+    """确保字幕文件是 UTF-8 编码，必要时转换。"""
+    import codecs
+
+    # 尝试检测编码
+    encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'gb18030', 'big5', 'shift_jis']
+    content = None
+    detected_encoding = None
+
+    for enc in encodings:
+        try:
+            with open(sub_path, 'r', encoding=enc) as f:
+                content = f.read()
+            detected_encoding = enc
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    if content is None:
+        _log.warning(f'[字幕编码] 无法检测编码: {sub_path.name}')
+        return sub_path
+
+    # 已经是 UTF-8 且无 BOM
+    if detected_encoding == 'utf-8':
+        return sub_path
+
+    # 需要转换：创建临时文件
+    tmp_sub = sub_path.with_suffix('.utf8' + sub_path.suffix)
+    try:
+        with open(tmp_sub, 'w', encoding='utf-8') as f:
+            f.write(content)
+        _log.info(f'[字幕编码] {sub_path.name} ({detected_encoding}) → UTF-8')
+        return tmp_sub
+    except Exception as e:
+        _log.warning(f'[字幕编码] 转换失败: {e}')
+        return sub_path
+
+
 def _embed_subtitle(
     media_path: Path,
     sub_path: Path,
@@ -240,6 +278,9 @@ def _embed_subtitle(
 
     import subprocess
 
+    # 确保字幕编码正确
+    sub_path_to_use = _ensure_utf8_subtitle(sub_path)
+
     # 输出临时文件
     tmp_path: Path = media_path.with_suffix(media_path.suffix + '.tmp')
 
@@ -248,7 +289,7 @@ def _embed_subtitle(
         cmd = [
             'ffmpeg', '-y',
             '-i', str(media_path),
-            '-i', str(sub_path),
+            '-i', str(sub_path_to_use),
             '-c', 'copy',
             '-c:s', 'mov_text',       # MP4 容器用 mov_text（兼容性最好）
             '-disposition:s:0', 'default',
@@ -260,7 +301,7 @@ def _embed_subtitle(
             cmd = [
                 'ffmpeg', '-y',
                 '-i', str(media_path),
-                '-i', str(sub_path),
+                '-i', str(sub_path_to_use),
                 '-c', 'copy',
                 '-c:s', 'ass',
                 '-disposition:s:0', 'default',
@@ -299,7 +340,7 @@ def _embed_subtitle(
         return False
 
 
-def embed_subtitles(save_dir: Path, stop_flag: Optional[threading.Event] = None) -> list[str]:
+def embed_subtitles(save_dir: Path, stop_flag: Optional[threading.Event] = None, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> list[str]:
     """扫描已下载目录，将匹配的字幕文件嵌入对应的音视频文件。\n\n    匹配规则：字幕文件名（去扩展名）与音视频文件名（去扩展名）相同，\n    或者字幕文件名是音视频文件名的前缀。\n\n    Args:\n        save_dir: 下载保存目录。\n        stop_flag: 停止信号。\n\n    Returns:\n        嵌入成功的文件名列表。\n    """
     if not _ffmpeg_available():
         _log.info('[字幕嵌入] ffmpeg 不可用，跳过')
@@ -322,8 +363,13 @@ def embed_subtitles(save_dir: Path, stop_flag: Optional[threading.Event] = None)
         return []
 
     embedded: list[str] = []
+    total_subs: int = len(sub_files)
+    done_subs: int = 0
 
     for sub_stem, sub_path in sub_files.items():
+        done_subs += 1
+        if progress_cb:
+            progress_cb(total_subs, done_subs, f'嵌入字幕: {sub_path.name[:30]}')
         if stop_flag and stop_flag.is_set():
             break
 
@@ -751,8 +797,8 @@ def download_all(
     # 下载完成后：扫描字幕文件并嵌入对应音视频
     if not (stop_flag and stop_flag.is_set()):
         try:
-            embedded = embed_subtitles(save_dir, stop_flag)
-            if embedded and progress_cb:
+            embedded = embed_subtitles(save_dir, stop_flag, progress_cb)
+            if embedded:
                 for name in embedded:
                     _log.info(f'[字幕嵌入] {name} 已嵌入字幕')
         except Exception as e:

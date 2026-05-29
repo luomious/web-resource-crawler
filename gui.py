@@ -137,7 +137,11 @@ class DownloadWorker(QThread):
             pct: int = min(int(done / total * 100), 100) if total else 0
             self._progress_count += 1
             # 节流：避免过于频繁的 UI 更新
-            if self._progress_count % 15 == 0 or "OK" in name or "Done" in name:
+            # 强制触发：第1次、每5次、或完成时
+            if (self._progress_count == 1 or 
+                self._progress_count % 5 == 0 or 
+                done >= total or
+                "跳过" in name or "OK" in name or "Done" in name):
                 self.progress.emit(total, done, name, pct)
 
         try:
