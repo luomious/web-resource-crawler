@@ -214,7 +214,8 @@ def _remux_with_ffmpeg(
             ts_path.unlink(missing_ok=True)
             return True
         else:
-            _log.warning(f'[ffmpeg] 转封装失败: {result.stderr.decode("utf-8", errors="replace")[:200]}')
+            _stderr = result.stderr.decode("utf-8", errors="replace")[:200] if isinstance(result.stderr, bytes) else str(result.stderr)[:200]
+            _log.warning(f'[ffmpeg] 转封装失败: {_stderr}')
             # 清理失败输出
             output_path.unlink(missing_ok=True)
             return False
@@ -283,7 +284,7 @@ def _embed_subtitle(
             _log.info(f'[字幕嵌入] {media_path.name} ← {sub_path.name} 成功')
             return True
         else:
-            stderr_text: str = result.stderr.decode('utf-8', errors='replace')[:300]
+            stderr_text: str = result.stderr.decode('utf-8', errors='replace')[:300] if isinstance(result.stderr, bytes) else str(result.stderr)[:300]
             _log.warning(f'[字幕嵌入] 失败: {stderr_text}')
             tmp_path.unlink(missing_ok=True)
             return False
