@@ -139,7 +139,7 @@ def fetch_all_urls(urls: list[str], max_workers: int = MAX_FETCH_WORKERS) -> lis
             _log.warning(f"[fetch_all] {url[:60]} 抓取失败: {e}")
             return []
 
-    workers = min(max_workers, len(urls), 8)
+    workers = max(1, min(max_workers, len(urls), 8)) if urls else 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_fetch_one, u): u for u in urls}
         for future in as_completed(futures):

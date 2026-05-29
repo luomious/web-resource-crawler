@@ -721,8 +721,9 @@ def download_all(
             progress_cb(total, done, str(rel_path)[:45])
 
     try:
+        hls_workers = max(1, min(len(hls_items), hls_max_workers or 4)) if hls_items else 1
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='dl') as normal_pool, \
-             ThreadPoolExecutor(max_workers=min(len(hls_items), hls_max_workers or 4), thread_name_prefix='hls') as hls_pool:
+             ThreadPoolExecutor(max_workers=hls_workers, thread_name_prefix='hls') as hls_pool:
 
             normal_futures = []
             hls_futures = []

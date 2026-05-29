@@ -1068,9 +1068,22 @@ class MainWindow(QMainWindow):
         # 系统托盘通知（窗口最小化时特别有用）
         self._show_tray_notification(len(ok_list), len(fail_list))
 
+        # 构建详细错误信息
+        msg_parts = [f"成功: {len(ok_list)} 项"]
+        if fail_list:
+            msg_parts.append(f"失败: {len(fail_list)} 项")
+            # 显示前 5 个错误详情
+            msg_parts.append("\n错误详情:")
+            for i, (url, err) in enumerate(fail_list[:5], 1):
+                # 提取文件名或 URL 最后部分
+                name = url.split('/')[-1].split('?')[0][:30] if url else "未知"
+                msg_parts.append(f"  {i}. {name}: {err[:50]}")
+            if len(fail_list) > 5:
+                msg_parts.append(f"  ... 还有 {len(fail_list) - 5} 个错误")
+        
         QMessageBox.information(
             self, "下载结果",
-            f"成功: {len(ok_list)} 项\n失败: {len(fail_list)} 项",
+            "\n".join(msg_parts),
         )
 
     def _show_tray_notification(self, ok_count: int, fail_count: int) -> None:
