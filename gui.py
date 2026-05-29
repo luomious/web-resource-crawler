@@ -404,21 +404,6 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(change_dir_btn)
         dir_row.addStretch()
         url_layout.addLayout(dir_row)
-
-        # 代理设置行
-        proxy_row: QHBoxLayout = QHBoxLayout()
-        proxy_row.addWidget(QLabel("代理:"))
-        self._proxy_input: QLineEdit = QLineEdit()
-        self._proxy_input.setPlaceholderText("http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
-        self._proxy_input.setMaximumWidth(300)
-        # 加载已保存的代理
-        saved_proxy: str = load_config().get("proxy", "") or ""
-        self._proxy_input.setText(saved_proxy)
-        self._proxy_input.textChanged.connect(self._on_proxy_text_changed)
-        proxy_row.addWidget(self._proxy_input)
-        proxy_row.addWidget(QLabel("\U0001f4a1 留空=直连"))
-        proxy_row.addStretch()
-        url_layout.addLayout(proxy_row)
         root_layout.addWidget(url_frame)
 
         # ── 三栏主内容区 ──
@@ -1362,28 +1347,6 @@ class MainWindow(QMainWindow):
             save_config(cfg)
             self._dir_label.setText(f"保存目录: {directory}")
             self._status_label.setText(f"保存目录: {directory}")
-
-    def _on_proxy_text_changed(self, text: str) -> None:
-        """代理输入变更时启动防抖计时器（500ms 后保存）。"""
-        if not hasattr(self, '_proxy_timer'):
-            from PyQt5.QtCore import QTimer
-            self._proxy_timer = QTimer()
-            self._proxy_timer.setSingleShot(True)
-            self._proxy_timer.timeout.connect(self._on_proxy_changed)
-        self._proxy_timer.start(500)
-
-    def _on_proxy_changed(self) -> None:
-        """代理输入防抖回调：保存到配置 + 重置共享 Session。"""
-        from core.fetcher import reset_shared_session
-        text = self._proxy_input.text()
-        cfg = load_config()
-        cfg["proxy"] = text.strip()
-        save_config(cfg)
-        reset_shared_session()
-        if text.strip():
-            self._status_label.setText(f"\U0001f310 代理已设置: {text.strip()}")
-        else:
-            self._status_label.setText("\U0001f310 直连（无代理）")
 
     # ── 拖放 URL ──────────────────────────────────────────────
 

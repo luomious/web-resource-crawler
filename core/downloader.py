@@ -54,9 +54,9 @@ _RETRY_TOTAL: int = 3
 
 
 def _make_session(pool_connections: int = 32, pool_maxsize: int = 64) -> requests.Session:
-    """创建带 Retry 策略的 Session（连接池复用 + 代理）。
+    """创建带 Retry 策略的 Session（连接池复用）。
 
-    复用 fetcher.make_session 的代理/重试配置，仅覆盖连接池大小。
+    复用 fetcher.make_session 的重试配置，仅覆盖连接池大小。
     """
     s = _fetcher_make_session()
     # 覆盖连接池大小（downloader 需要更大的池）
