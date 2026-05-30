@@ -748,7 +748,7 @@ def download_all(
         output: Path = save_dir / rel_path
 
         if progress_cb:
-            progress_cb(total, counter['done'], f'HLS: {rel_path}')
+            progress_cb(total, counter['done'], f'HLS: {rel_path}', 0)
 
         path, err = download_hls(
             r.url,
@@ -762,9 +762,10 @@ def download_all(
             results_dict[idx] = (r.url, STOPPED_MARKER)
         elif not err:
             results_dict[idx] = (r.url, path)
-            sz_mb: float = Path(path).stat().st_size / 1024 / 1024
+            sz: int = Path(path).stat().st_size
+            sz_mb: float = sz / 1024 / 1024
             if progress_cb:
-                progress_cb(total, _inc_done(), f'OK: {rel_path} ({sz_mb:.1f}MB)')
+                progress_cb(total, _inc_done(), f'OK: {rel_path} ({sz_mb:.1f}MB)', sz)
         else:
             results_dict[idx] = (r.url, err)
             _inc_done()
@@ -782,9 +783,10 @@ def download_all(
         # 跳过已存在的文件（避免重复下载）
         if output.exists() and output.stat().st_size > 0:
             results_dict[idx] = (r.url, str(output))
+            sz: int = output.stat().st_size
             done: int = _inc_done()
             if progress_cb:
-                progress_cb(total, done, f'跳过: {str(rel_path)[:30]}')
+                progress_cb(total, done, f'跳过: {str(rel_path)[:30]}', sz)
             return
 
         # 传入指定输出路径，保留目录结构
@@ -795,7 +797,14 @@ def download_all(
         results_dict[idx] = (r.url, path if not err else err)
         done: int = _inc_done()
         if progress_cb:
-            progress_cb(total, done, str(rel_path)[:45])
+            # 获取已下载文件大小
+            sz = 0
+            if path and not err and Path(path).exists():
+                try:
+                    sz = Path(path).stat().st_size
+                except OSError:
+                    pass
+            progress_cb(total, done, str(rel_path)[:45], sz)
 
     try:
         hls_workers = max(1, min(len(hls_items), hls_max_workers or 4)) if hls_items else 1

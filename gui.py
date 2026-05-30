@@ -67,9 +67,11 @@ class FetchWorker(QThread):
     Signals:
         finished(str, list[Resource]): (显示标签, 去重资源列表)
         error(str): 错误信息
+        status(str): 实时状态更新
     """
     finished = pyqtSignal(str, list)
     error = pyqtSignal(str)
+    status = pyqtSignal(str)
 
     def __init__(self, urls: List[str]) -> None:
         """初始化抓取线程。
@@ -83,7 +85,10 @@ class FetchWorker(QThread):
     def run(self) -> None:
         """执行抓取（在后台线程中运行，禁止直接操作 UI）。"""
         try:
-            all_resources = fetch_resources(self._urls)
+            all_resources = fetch_resources(
+                self._urls,
+                status_cb=lambda msg: self.status.emit(msg),
+            )
             label = get_label_for_urls(self._urls)
             self.finished.emit(label, all_resources)
         except Exception as e:
@@ -100,10 +105,10 @@ class DownloadWorker(QThread):
     finished 信号返回分类后的结果。
 
     Signals:
-        progress(int, int, str, int): (total, done, 文件名, 百分比)
+        progress(int, int, str, int, int): (total, done, 文件名, 百分比, bytes_done)
         finished(list, list, list): (ok_list, fail_list, stop_list)
     """
-    progress = pyqtSignal(int, int, str, int)
+    progress = pyqtSignal(int, int, str, int, int)
     finished = pyqtSignal(list, list, list)
 
     def __init__(
@@ -130,11 +135,16 @@ class DownloadWorker(QThread):
         self._max_workers: int = max_workers
         self._hls_max_workers: int = hls_max_workers
         self._progress_count: int = 0
+        self._bytes_done: int = 0
+        self._bytes_lock: threading.Lock = threading.Lock()
 
     def run(self) -> None:
         """执行下载（在后台线程中运行）。"""
-        def progress_cb(total: int, done: int, name: str) -> None:
+        def progress_cb(total: int, done: int, name: str, bytes_delta: int = 0) -> None:
             """下载进度回调（线程安全）。"""
+            with self._bytes_lock:
+                self._bytes_done += bytes_delta
+                current_bytes = self._bytes_done
             pct: int = min(int(done / total * 100), 100) if total else 0
             self._progress_count += 1
             # 节流：避免过于频繁的 UI 更新
@@ -143,7 +153,7 @@ class DownloadWorker(QThread):
                 self._progress_count % 5 == 0 or 
                 done >= total or
                 "跳过" in name or "OK" in name or "Done" in name):
-                self.progress.emit(total, done, name, pct)
+                self.progress.emit(total, done, name, pct, current_bytes)
 
         try:
             results = download_all(
@@ -287,7 +297,7 @@ class MainWindow(QMainWindow):
 
         # 下载速度追踪
         self._dl_start_time: float = 0.0
-        self._dl_last_done: int = 0
+        self._dl_last_bytes: int = 0
         self._dl_last_time: float = 0.0
 
         # 资源树中叶子节点 → Resource 的映射（用于快速查找）
@@ -404,6 +414,13 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(change_dir_btn)
         dir_row.addStretch()
         url_layout.addLayout(dir_row)
+
+        # 抓取实时状态标签
+        self._fetch_status_label: QLabel = QLabel("")
+        self._fetch_status_label.setStyleSheet("color: #888; font-size: 11px; padding-left: 2px;")
+        self._fetch_status_label.hide()
+        url_layout.addWidget(self._fetch_status_label)
+
         root_layout.addWidget(url_frame)
 
         # ── 三栏主内容区 ──
@@ -630,6 +647,7 @@ class MainWindow(QMainWindow):
         self._fetch_worker = FetchWorker(urls)
         self._fetch_worker.finished.connect(self._on_fetch_done)
         self._fetch_worker.error.connect(self._on_fetch_error)
+        self._fetch_worker.status.connect(self._on_fetch_status)
         self._fetch_worker.start()
 
     # ── 筛选按钮动态生成 ───────────────────────────────────
@@ -685,13 +703,20 @@ class MainWindow(QMainWindow):
         """FetchWorker 异常回调。"""
         self._fetch_btn.setEnabled(True)
         self._dl_btn.setEnabled(True)
+        self._fetch_status_label.hide()
         self._status_label.setText(f"\u274c {msg}")
         QMessageBox.warning(self, "抓取失败", msg)
+
+    def _on_fetch_status(self, msg: str) -> None:
+        """FetchWorker 实时状态回调。"""
+        self._fetch_status_label.setText(msg)
+        self._fetch_status_label.show()
 
     def _on_fetch_done(self, label: str, resources: List[Resource]) -> None:
         """FetchWorker 完成回调：构建资源树 + 更新筛选按钮。"""
         self._fetch_btn.setEnabled(True)
         self._dl_btn.setEnabled(True)
+        self._fetch_status_label.hide()
         self.resources = resources
         self._current_filter = None
         self._status_label.setText(f"\u2705 找到 {len(resources)} 个资源")
@@ -1110,7 +1135,7 @@ class MainWindow(QMainWindow):
 
         # 重置速度追踪
         self._dl_start_time = time.monotonic()
-        self._dl_last_done = 0
+        self._dl_last_bytes = 0
         self._dl_last_time = time.monotonic()
 
         # 禁用抓取/下载按钮，启用停止按钮
@@ -1145,7 +1170,7 @@ class MainWindow(QMainWindow):
         self._dl_worker.start()
 
     def _on_download_progress(
-        self, total: int, done: int, name: str, pct: int
+        self, total: int, done: int, name: str, pct: int, bytes_done: int
     ) -> None:
         """下载进度回调：更新进度条和文件条目文本。
 
@@ -1156,26 +1181,42 @@ class MainWindow(QMainWindow):
             done: 已完成数。
             name: 当前下载中的文件名或进度信息。
             pct: 完成百分比（0-100）。
+            bytes_done: 累计已下载字节数。
         """
         self._progress.setValue(pct)
 
-        # 计算下载速度
+        # 计算下载速度（基于真实字节数）
         now = time.monotonic()
         speed_text = ""
         elapsed = now - self._dl_last_time
         if elapsed >= 0.5:  # 每 0.5 秒更新一次速度
-            delta_done = done - self._dl_last_done
-            if delta_done > 0:
-                # 估算：已完成项数 / 时间 = 项/秒
-                items_per_sec = delta_done / elapsed
-                # 估算总耗时
-                if done > 0 and done < total:
-                    remaining = (total - done) / items_per_sec if items_per_sec > 0 else 0
-                    if remaining < 60:
-                        speed_text = f" | 剩余 {remaining:.0f}s"
+            delta_bytes = bytes_done - self._dl_last_bytes
+            if delta_bytes > 0:
+                speed_bps = delta_bytes / elapsed  # bytes/sec
+                if speed_bps > 1024 * 1024:
+                    speed_str = f"{speed_bps / 1024 / 1024:.1f}MB/s"
+                else:
+                    speed_str = f"{speed_bps / 1024:.0f}KB/s"
+                # 剩余时间估算
+                if done > 0 and done < total and self._dl_start_time > 0:
+                    total_elapsed = now - self._dl_start_time
+                    if total_elapsed > 1:  # 至少1秒后才估算
+                        avg_speed = bytes_done / total_elapsed
+                        if avg_speed > 0:
+                            # 按项数进度估算剩余
+                            remaining_items = total - done
+                            remaining_secs = remaining_items * (total_elapsed / done)
+                            if remaining_secs < 60:
+                                speed_text = f" | {speed_str}, 剩余 {remaining_secs:.0f}s"
+                            else:
+                                speed_text = f" | {speed_str}, 剩余 {remaining_secs/60:.1f}min"
+                        else:
+                            speed_text = f" | {speed_str}"
                     else:
-                        speed_text = f" | 剩余 {remaining/60:.1f}min"
-            self._dl_last_done = done
+                        speed_text = f" | {speed_str}"
+                else:
+                    speed_text = f" | {speed_str}"
+            self._dl_last_bytes = bytes_done
             self._dl_last_time = now
 
         # 从回调 name 中提取纯净文件名（去掉 OK:/跳过:/HLS: 等前缀和大小后缀）
@@ -1245,7 +1286,9 @@ class MainWindow(QMainWindow):
                 sz_str: str = f"{sz / 1024 / 1024:.1f}MB"
             else:
                 sz_str = f"{sz / 1024:.0f}KB"
-            self._dl_list.addItem(f"\u2705 {fname} ({sz_str})")
+            item = QListWidgetItem(f"\u2705 {fname} ({sz_str})")
+            item.setData(Qt.UserRole, path)  # 存储完整路径，双击时用
+            self._dl_list.addItem(item)
 
         for _, err in fail_list:
             self._dl_list.addItem(f"\u274c {err[:60]}")
@@ -1385,20 +1428,25 @@ class MainWindow(QMainWindow):
         # 成功项格式: ✅ 文件名 (大小)
         if not text.startswith("\u2705"):
             return
-        # 提取文件名
+
+        # 优先使用存储的完整路径
+        stored_path = item.data(Qt.UserRole)
+        if stored_path and Path(stored_path).exists():
+            import subprocess
+            subprocess.Popen(f'explorer /select,"{Path(stored_path)}"')
+            return
+
+        # fallback: 提取文件名在保存目录中查找
         fname = text.lstrip("\u2705 ").rsplit(" (", 1)[0].strip()
         if not fname:
             return
-        # 在保存目录中查找
         target = self._save_dir / fname
         if not target.exists():
-            # 递归搜索子目录
             for p in self._save_dir.rglob(fname):
                 target = p
                 break
         if target.exists():
             import subprocess
-            # Windows: 选中文件并打开所在目录
             subprocess.Popen(f'explorer /select,"{target}"')
 
     # ── URL 历史弹出菜单 ─────────────────────────────────────

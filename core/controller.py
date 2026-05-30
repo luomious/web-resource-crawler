@@ -54,13 +54,14 @@ def normalize_urls(raw_text: str) -> list[str]:
     return result
 
 
-def fetch_resources(urls: list[str]) -> list[Resource]:
+def fetch_resources(urls: list[str], status_cb=None) -> list[Resource]:
     '''批量抓取网页的资源列表。
 
     对每个 URL 执行 fetch_html + parse_resources，汇总去重后返回。
 
     Args:
         urls: 目标页面 URL 列表。
+        status_cb: 可选的状态回调函数，接收字符串消息。
 
     Returns:
         Resource 对象列表。单个 URL 失败不影响其他 URL 的结果。
@@ -73,14 +74,22 @@ def fetch_resources(urls: list[str]) -> list[Resource]:
     all_resources: list[Resource] = []
     seen_urls: set[str] = set()
 
-    for url in urls:
+    for i, url in enumerate(urls):
         try:
+            if status_cb:
+                status_cb(f'正在加载页面 ({i+1}/{len(urls)})…')
             html: str = fetch_html(url)
+            if status_cb:
+                status_cb(f'正在解析资源 ({i+1}/{len(urls)})…')
             parsed: list[Resource] = parse_resources(html, url, source_url=url)
+            count = 0
             for r in parsed:
                 if r.url not in seen_urls:
                     seen_urls.add(r.url)
                     all_resources.append(r)
+                    count += 1
+            if status_cb:
+                status_cb(f'已找到 {len(all_resources)} 个资源 ({i+1}/{len(urls)})…')
         except Exception as e:
             _log.warning(f'[controller] {url[:60]} 抓取失败: {e}')
 
