@@ -989,6 +989,13 @@ def download_all(
         if progress_cb:
             progress_cb(total, counter['done'], f'HLS: {rel_path}', 0)
 
+        # 内层 HLS 分片进度透传到外层
+        _hls_base_done = counter['done']
+        def _hls_progress_cb(seg_total, seg_done, msg):
+            if progress_cb:
+                # 透传分片进度，但不增加外层 done 计数
+                progress_cb(total, _hls_base_done, f'HLS: {rel_path} [{seg_done}/{seg_total}]', 0)
+
         path, err = download_hls(
             r.url,
             output,
@@ -996,6 +1003,7 @@ def download_all(
             max_workers=hls_max_workers,
             session=shared_session,
             is_audio=(r.rtype in ("\u97f3\u9891", "\u97f3\u9891-HLS")),
+            progress_cb=_hls_progress_cb,
         )
         if err == STOPPED_MARKER:
             results_dict[idx] = (r.url, STOPPED_MARKER)
