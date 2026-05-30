@@ -55,7 +55,7 @@ class Resource:
 
     Attributes:
         url: 资源完整 URL。
-        rtype: 资源类型（图片 / 音频 / 视频 / 音频-HLS / 样式 / 脚本 / 文档）。
+        rtype: 资源类型（图片 / 音频 / 视频 / 音频-HLS / 视频-HLS / 样式 / 脚本 / 文档）。
         name: 文件名（从 URL 提取并解码）。
         size: 文件大小字符串（预留字段，当前未使用）。
         checked: 是否默认勾选（GUI 用）。
@@ -86,6 +86,9 @@ def classify(url: str, candidate_type: str = "") -> str:
         if ext in lower:
             return "视频"
     if ".m3u8" in lower:
+        # 根据 URL 关键词区分视频/音频 HLS
+        if any(kw in lower for kw in ("video", "mp4", "movie", "vid")):
+            return "视频-HLS"
         return "音频-HLS"
     for ext in CSS_EXTS:
         if ext in lower:
@@ -194,7 +197,7 @@ def _make_add(
 def _parse_hls(html: str, _add: Callable) -> None:
     """层1：m3u8 HLS 流（直接引用 + JS 混淆解码）。"""
     for url in extract_m3u8_from_html(html):
-        _add(url, "音频-HLS")
+        _add(url, "")  # let classify decide audio/video HLS
 
 
 def _parse_imgs(soup: BeautifulSoup, _add: Callable) -> None:
@@ -234,7 +237,7 @@ def _parse_media_links(soup: BeautifulSoup, _add: Callable) -> None:
         if ext in AUDIO_EXTS or ext in VIDEO_EXTS:
             _add(href, classify(href))
         elif ".m3u8" in lower:
-            _add(href, "音频-HLS")
+            _add(href, classify(href))  # classify handles audio/video HLS
 
 
 def _parse_css_js(soup: BeautifulSoup, _add: Callable) -> None:
@@ -347,6 +350,6 @@ def parse_resources(html: str, base_url: str, source_url: str = "") -> list:
         f"(HLS:{sum(1 for r in resources if 'HLS' in r.rtype)}, "
         f"图:{sum(1 for r in resources if r.rtype=='图片')}, "
         f"音:{sum(1 for r in resources if '音频' in r.rtype)}, "
-        f"视:{sum(1 for r in resources if r.rtype=='视频')})"
+        f"视:{sum(1 for r in resources if '视频' in r.rtype)})"
     )
     return resources

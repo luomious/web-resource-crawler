@@ -756,7 +756,7 @@ def download_all(
             stop_flag=stop_flag,
             max_workers=hls_max_workers,
             session=shared_session,
-            is_audio=(r.rtype == "\u97f3\u9891"),
+            is_audio=(r.rtype in ("\u97f3\u9891", "\u97f3\u9891-HLS")),
         )
         if err == STOPPED_MARKER:
             results_dict[idx] = (r.url, STOPPED_MARKER)

@@ -457,10 +457,11 @@ class MainWindow(QMainWindow):
         mid_layout.addLayout(filter_row)
 
         self._res_tree: QTreeWidget = QTreeWidget()
-        self._res_tree.setHeaderLabels(["名称", "类型"])
+        self._res_tree.setHeaderLabels(["名称", "类型", "大小"])
         self._res_tree.header().setStretchLastSection(False)
         self._res_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._res_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._res_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self._res_tree.setColumnWidth(1, 80)
         self._res_tree.itemClicked.connect(self._on_preview)
         self._res_tree.itemChanged.connect(self._on_item_changed)
@@ -586,7 +587,7 @@ class MainWindow(QMainWindow):
                 else:
                     parent = type_node
 
-                leaf = QTreeWidgetItem(parent, [r.name, r.rtype])
+                leaf = QTreeWidgetItem(parent, [r.name, r.rtype, r.size])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
                 self._leaf_to_resource[id(leaf)] = r
@@ -607,7 +608,7 @@ class MainWindow(QMainWindow):
                         parent = folder_item
 
                 # 叶子节点
-                leaf = QTreeWidgetItem(parent, [parts[-1], r.rtype])
+                leaf = QTreeWidgetItem(parent, [parts[-1], r.rtype, r.size])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
                 self._leaf_to_resource[id(leaf)] = r
@@ -658,6 +659,7 @@ class MainWindow(QMainWindow):
         "音频": "🎵",
         "视频": "🎬",
         "音频-HLS": "📻",
+        "视频-HLS": "🎬",
         "样式": "🎨",
         "脚本": "📜",
         "文档": "📄",
@@ -1288,10 +1290,18 @@ class MainWindow(QMainWindow):
                 sz_str = f"{sz / 1024:.0f}KB"
             item = QListWidgetItem(f"\u2705 {fname} ({sz_str})")
             item.setData(Qt.UserRole, path)  # 存储完整路径，双击时用
+            item.setForeground(QColor("#4CAF50"))  # 绿色=成功
             self._dl_list.addItem(item)
 
         for _, err in fail_list:
-            self._dl_list.addItem(f"\u274c {err[:60]}")
+            item = QListWidgetItem(f"\u274c {err[:60]}")
+            item.setForeground(QColor("#F44336"))  # 红色=失败
+            self._dl_list.addItem(item)
+
+        for _, marker in stop_list:
+            item = QListWidgetItem(f"\u23f9 {marker[:60]}")
+            item.setForeground(QColor("#FF9800"))  # 橙色=已停止
+            self._dl_list.addItem(item)
 
         # 滚动到列表底部
         self._dl_list.scrollToBottom()
@@ -1301,8 +1311,18 @@ class MainWindow(QMainWindow):
         )
 
         # 下载成功后自动取消对应资源的勾选，避免重复下载
+        # 同时回填资源树中的文件大小列
         if ok_list:
             ok_urls = {url for url, _, _ in ok_list}
+            # Build url→size map for backfilling
+            url_sizes: Dict[str, str] = {}
+            for url, path, sz in ok_list:
+                if sz > 1024 * 1024:
+                    url_sizes[url] = f"{sz / 1024 / 1024:.1f}MB"
+                elif sz > 1024:
+                    url_sizes[url] = f"{sz / 1024:.0f}KB"
+                else:
+                    url_sizes[url] = f"{sz}B"
             self._res_tree.blockSignals(True)
             it = QTreeWidgetItemIterator(self._res_tree)
             while it.value():
@@ -1311,6 +1331,9 @@ class MainWindow(QMainWindow):
                     r = item.data(0, Qt.UserRole)
                     if r is not None and r.url in ok_urls:
                         item.setCheckState(0, Qt.Unchecked)
+                        # 回填文件大小到第三列
+                        if r.url in url_sizes:
+                            item.setText(2, url_sizes[r.url])
                 it += 1
             self._sync_all_folder_checks()
             self._res_tree.blockSignals(False)
