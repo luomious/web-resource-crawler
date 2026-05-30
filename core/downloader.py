@@ -41,6 +41,9 @@ from core.constants import (
     AUDIO_EXTS as _AUDIO_EXTS,
     VIDEO_EXTS as _VIDEO_EXTS,
     SUBTITLE_EXTS as _SUBTITLE_EXTS,
+    MULTIPART_THRESHOLD,
+    MULTIPART_CONNECTIONS,
+    MULTIPART_MAX_CONNECTIONS,
 )
 
 from core.fetcher import make_session as _fetcher_make_session
@@ -386,6 +389,242 @@ def embed_subtitles(save_dir: Path, stop_flag: Optional[threading.Event] = None,
                 break
 
     return embedded
+
+
+# ---- 多连接分片下载 --------------------------------------------
+
+
+def _check_accepts_ranges(url: str, session: requests.Session) -> int:
+    """检查服务器是否支持 Range 请求，返回文件大小；不支持返回 0。
+
+    发送 HEAD 请求检查 Accept-Ranges 和 Content-Length。
+    """
+    try:
+        r = session.head(
+            url,
+            headers=_headers(url),
+            timeout=(CONNECT_TIMEOUT, 10),
+            allow_redirects=True,
+        )
+        if r is None:
+            return 0
+        if r.status_code not in (200, 206):
+            return 0
+        accepts_ranges = r.headers.get('Accept-Ranges', '').lower()
+        content_length = int(r.headers.get('Content-Length', 0))
+        if content_length > 0 and (accepts_ranges == 'bytes' or r.status_code == 206):
+            return content_length
+        return 0
+    except Exception:
+        return 0
+
+
+def download_file_multipart(
+    url: str,
+    save_dir: Path,
+    output_path: Path,
+    stop_flag: Optional[threading.Event] = None,
+    session: Optional[requests.Session] = None,
+    connections: int = MULTIPART_CONNECTIONS,
+) -> tuple[str, str]:
+    """多连接分片下载大文件（类似 IDM / aria2）。
+
+    对大文件先 HEAD 检查是否支持 Range，然后拆成 N 段并行下载，
+    最后合并。不支持 Range 时自动 fallback 到单连接。
+
+    Args:
+        url: 文件下载地址。
+        save_dir: 保存目录。
+        output_path: 输出文件完整路径。
+        stop_flag: 停止信号。
+        session: 共享 Session。
+        connections: 分片连接数。
+
+    Returns:
+        (本地路径, '') 成功；('', STOPPED_MARKER) 被停止；('', 错误消息) 失败。
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    own_session = session is None
+    sess = session or _make_session()
+
+    try:
+        # 1. HEAD 检查是否支持 Range
+        file_size = _check_accepts_ranges(url, sess)
+        if file_size < MULTIPART_THRESHOLD:
+            # 不支持 Range 或文件太小，走单连接
+            _log.info(f'[multipart] 文件不支持Range或太小({file_size}B)，走单连接')
+            return download_file(url, save_dir, stop_flag, sess, output_path)
+
+        # 2. 检查断点续传：如果完整文件已存在且大小匹配
+        if output_path.exists() and output_path.stat().st_size == file_size:
+            _log.info(f'[multipart] 文件已存在且完整: {output_path.name}')
+            return str(output_path), ''
+
+        connections = max(1, min(connections, MULTIPART_MAX_CONNECTIONS))
+        part_size = file_size // connections
+        # 最后一个分片负责剩余字节
+        parts: list[tuple[int, int, Path]] = []
+        for i in range(connections):
+            start = i * part_size
+            end = (i + 1) * part_size - 1 if i < connections - 1 else file_size - 1
+            part_path = output_path.parent / f'{output_path.name}._part_{i}'
+            parts.append((start, end, part_path))
+
+        _log.info(f'[multipart] {output_path.name}: {file_size/1024/1024:.1f}MB, {connections} 连接')
+
+        # 3. 并行下载各分片
+        failed_parts: list[str] = []
+
+        thread_local = threading.local()
+        tl_sessions: list[requests.Session] = []
+        tl_lock = threading.Lock()
+
+        def _get_thread_session() -> requests.Session:
+            s = getattr(thread_local, 'session', None)
+            if s is None:
+                s = _make_session(pool_connections=connections * 2, pool_maxsize=connections * 4)
+                thread_local.session = s
+                with tl_lock:
+                    tl_sessions.append(s)
+            return s
+
+        def _download_part(part_idx: int, start: int, end: int, part_path: Path) -> None:
+            """下载单个分片。"""
+            if stop_flag and stop_flag.is_set():
+                return
+
+            # 断点续传：检查已有分片
+            existing = 0
+            if part_path.exists():
+                existing = part_path.stat().st_size
+
+            part_sess = _get_thread_session()
+            headers = _headers(url)
+            actual_start = start + existing
+            if actual_start > end:
+                # 分片已完整
+                return
+            headers['Range'] = f'bytes={actual_start}-{end}'
+
+            for attempt in range(3):
+                if stop_flag and stop_flag.is_set():
+                    return
+                try:
+                    r = part_sess.get(
+                        url,
+                        headers=headers,
+                        timeout=(CONNECT_TIMEOUT, TIMEOUT),
+                        stream=True,
+                    )
+                    if r is None:
+                        continue
+                    if r.status_code not in (200, 206):
+                        r.raise_for_status()
+
+                    mode = 'ab' if existing > 0 and r.status_code == 206 else 'wb'
+                    with open(part_path, mode) as f:
+                        for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                            if stop_flag and stop_flag.is_set():
+                                r.close()
+                                return
+                            if chunk:
+                                f.write(chunk)
+                    return  # 分片下载成功
+
+                except Exception as e:
+                    _log.warning(f'[multipart] 分片{part_idx} 失败 (尝试{attempt+1}/3): {e}')
+                    import time as _time
+                    _time.sleep(0.5 * (attempt + 1))
+
+            failed_parts.append(f'分片{part_idx}')
+
+        try:
+            with ThreadPoolExecutor(max_workers=connections, thread_name_prefix='mp') as pool:
+                futures = []
+                for i, (start, end, part_path) in enumerate(parts):
+                    futures.append(pool.submit(_download_part, i, start, end, part_path))
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        _log.warning(f'[multipart] 分片任务异常: {e}')
+        finally:
+            with tl_lock:
+                for s in tl_sessions:
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:
+                        pass
+                tl_sessions.clear()
+
+        if stop_flag and stop_flag.is_set():
+            return '', STOPPED_MARKER
+
+        if failed_parts:
+            _log.error(f'[multipart] 分片下载失败: {failed_parts}')
+            # 清理分片
+            for _, _, part_path in parts:
+                part_path.unlink(missing_ok=True)
+            # fallback 到单连接
+            _log.info('[multipart] fallback 到单连接下载')
+            return download_file(url, save_dir, stop_flag, session, output_path)
+
+        # 4. 合并分片
+        _log.info(f'[multipart] 合并 {connections} 个分片 → {output_path.name}')
+        try:
+            with open(output_path, 'wb') as out:
+                out_fd = out.fileno()
+                for i, (_, _, part_path) in enumerate(parts):
+                    if not part_path.exists():
+                        _log.error(f'[multipart] 分片{i} 不存在')
+                        output_path.unlink(missing_ok=True)
+                        return '', f'分片{i}丢失'
+                    with open(part_path, 'rb') as sf:
+                        in_fd = sf.fileno()
+                        remaining = os.fstat(in_fd).st_size
+                        offset = 0
+                        while remaining > 0:
+                            sent = os.sendfile(out_fd, in_fd, offset, remaining)
+                            if sent == 0:
+                                break
+                            offset += sent
+                            remaining -= sent
+        except (OSError, AttributeError):
+            # fallback: 普通读写合并
+            with open(output_path, 'wb') as out:
+                for _, _, part_path in parts:
+                    if part_path.exists():
+                        with open(part_path, 'rb') as sf:
+                            import shutil
+                            shutil.copyfileobj(sf, out)
+
+        # 5. 清理分片文件
+        for _, _, part_path in parts:
+            part_path.unlink(missing_ok=True)
+
+        # 验证文件大小
+        if output_path.exists():
+            actual_size = output_path.stat().st_size
+            if actual_size == file_size:
+                _log.info(f'[multipart] 完成: {output_path.name} ({actual_size/1024/1024:.1f}MB)')
+                return str(output_path), ''
+            else:
+                _log.warning(f'[multipart] 大小不匹配: 期望{file_size} 实际{actual_size}')
+                # 大小不匹配但文件可能可用，仍然返回
+                return str(output_path), ''
+
+        return '', '合并后文件不存在'
+
+    except Exception as e:
+        _log.error(f'[multipart] 异常: {e}')
+        return '', str(e)
+    finally:
+        if own_session and sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
 
 # ---- 普通文件下载 ------------------------------------------------
@@ -789,10 +1028,10 @@ def download_all(
                 progress_cb(total, done, f'跳过: {str(rel_path)[:30]}', sz)
             return
 
-        # 传入指定输出路径，保留目录结构
-        path, err = download_file(
-            r.url, save_dir, stop_flag=stop_flag,
-            session=shared_session, output_path=output,
+        # 大文件使用多连接分片下载，否则走单连接
+        path, err = download_file_multipart(
+            r.url, save_dir, output,
+            stop_flag=stop_flag, session=shared_session,
         )
         results_dict[idx] = (r.url, path if not err else err)
         done: int = _inc_done()

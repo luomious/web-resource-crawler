@@ -7,7 +7,7 @@
 from typing import Final
 
 # ── 版本号 ─────────────────────────────────────────────
-APP_VERSION: Final[str] = "1.3.0"
+APP_VERSION: Final[str] = "1.5.0"
 APP_NAME: Final[str] = "Web Resource Crawler"
 
 # ── HTTP 请求 ──────────────────────────────────────────
@@ -42,6 +42,16 @@ SUBTITLE_EXTS: Final[set[str]] = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx"
 # ── 下载器 ────────────────────────────────────────────
 CHUNK_SIZE: Final[int] = 65536              # scraper 侧
 DOWNLOAD_CHUNK_SIZE: Final[int] = 1048576   # downloader 侧 (1MB)
+
+# ── 多连接分片下载 ────────────────────────────────────
+MULTIPART_THRESHOLD: Final[int] = 10_485_760   # 10MB 以上启用多连接分片
+MULTIPART_CONNECTIONS: Final[int] = 4            # 分片连接数
+MULTIPART_MAX_CONNECTIONS: Final[int] = 8        # 分片连接数上限
+
+# ── 多连接分片下载 ───────────────────────────────────
+MULTIPART_THRESHOLD: Final[int] = 10 * 1024 * 1024   # 大于此大小启用多连接 (10MB)
+MULTIPART_CONNECTIONS: Final[int] = 4                  # 分片连接数
+MULTIPART_MAX_CONNECTIONS: Final[int] = 8              # 分片连接数上限
 
 # ── asmr.one ──────────────────────────────────────────
 ASMR_ONE_PATTERN_STR: Final[str] = r'asmr\.one/work/(RJ\d+)'

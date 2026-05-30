@@ -81,10 +81,17 @@ def parse_asmr_one(url: str) -> list:
             _log.warning(f"[asmr.one] 作品信息返回 None 响应: {rj}")
             return []
         info_r.raise_for_status()
-        work_id = info_r.json().get("id")
+        info_json = info_r.json()
+        work_id = info_json.get("id")
         if not work_id:
             _log.warning(f"[asmr.one] 未找到作品ID: {rj}")
             return []
+
+        # 提取作品名，构建文件夹前缀 "RJ号 - 作品名"
+        work_title = info_json.get("title", "") or ""
+        # 清理文件夹名中的非法字符
+        safe_title = re.sub(r'[:*?"<>|]', '', work_title.strip()).rstrip('.')
+        folder_prefix = f"{rj} - {safe_title}" if safe_title else rj
 
         # 2. 获取文件树
         tracks_r = sess.get(
@@ -136,7 +143,7 @@ def parse_asmr_one(url: str) -> list:
                     for child in nodes.get("children", []):
                         walk(child, current_path)
 
-        walk(tree)
+        walk(tree, folder_prefix)
         _log.info(f"[asmr.one] {rj} → {len(resources)} 个资源")
 
     except requests.RequestException as e:
