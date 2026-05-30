@@ -1073,15 +1073,7 @@ def download_all(
         except Exception as e:
             _log.warning(f'[download_all] 关闭 shared_session 异常: {e}')
 
-    # 下载完成后：扫描字幕文件并嵌入对应音视频
-    if not (stop_flag and stop_flag.is_set()):
-        try:
-            embedded = embed_subtitles(save_dir, stop_flag, progress_cb)
-            if embedded:
-                for name in embedded:
-                    _log.info(f'[字幕嵌入] {name} 已嵌入字幕')
-        except Exception as e:
-            _log.warning(f'[字幕嵌入] 后处理异常: {e}')
+    # 字幕嵌入已移至 GUI 层（DownloadWorker），此处不再调用
 
     return [
         results_dict.get(i, (resources[i].url, '未完成'))

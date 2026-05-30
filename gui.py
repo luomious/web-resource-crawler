@@ -106,9 +106,11 @@ class DownloadWorker(QThread):
 
     Signals:
         progress(int, int, str, int, int): (total, done, 文件名, 百分比, bytes_done)
+        subtitle_progress(int, int, str): (total, done, 字幕名) — 字幕嵌入进度
         finished(list, list, list): (ok_list, fail_list, stop_list)
     """
     progress = pyqtSignal(int, int, str, int, int)
+    subtitle_progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(list, list, list)
 
     def __init__(
@@ -171,9 +173,26 @@ class DownloadWorker(QThread):
             self.finished.emit([], failed, [])
             return
 
+        # ── 字幕嵌入后处理 ──
+        embedded_names: list[str] = []
+        if not self._stop_flag.is_set():
+            try:
+                from core.downloader import embed_subtitles
+                def sub_progress_cb(total: int, done: int, name: str) -> None:
+                    self.subtitle_progress.emit(total, done, name)
+                embedded_names = embed_subtitles(
+                    self._save_dir, self._stop_flag, sub_progress_cb,
+                )
+            except Exception as e:
+                import logging as _log2
+                _log2.getLogger(__name__).warning(f'[字幕嵌入] 异常: {e}')
+
         # 分类结果（交由 controller 层处理）
         from core.controller import classify_download_results, STOPPED_MARKER
         ok_list, fail_list, stop_list = classify_download_results(results)
+
+        # 将字幕嵌入成功数附加到 ok_list（通过在 finished 后由 GUI 处理）
+        self._embedded_names = embedded_names
         self.finished.emit(ok_list, fail_list, stop_list)
 
 
@@ -590,6 +609,10 @@ class MainWindow(QMainWindow):
                 leaf = QTreeWidgetItem(parent, [r.name, r.rtype, r.size])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
+                # 字幕项标记将自动嵌入
+                if r.rtype == "字幕":
+                    leaf.setText(1, "字幕→嵌入")
+                    leaf.setToolTip(1, "下载后将自动嵌入匹配的音视频文件")
                 self._leaf_to_resource[id(leaf)] = r
             else:
                 # 有路径 — 保持原有层级，挂在类型节点下
@@ -611,6 +634,10 @@ class MainWindow(QMainWindow):
                 leaf = QTreeWidgetItem(parent, [parts[-1], r.rtype, r.size])
                 leaf.setData(0, Qt.UserRole, r)
                 leaf.setCheckState(0, Qt.Unchecked)
+                # 字幕项标记将自动嵌入
+                if r.rtype == "字幕":
+                    leaf.setText(1, "字幕→嵌入")
+                    leaf.setToolTip(1, "下载后将自动嵌入匹配的音视频文件")
                 self._leaf_to_resource[id(leaf)] = r
 
         self._res_tree.blockSignals(False)
@@ -1168,6 +1195,7 @@ class MainWindow(QMainWindow):
             self._hls_max_workers,
         )
         self._dl_worker.progress.connect(self._on_download_progress)
+        self._dl_worker.subtitle_progress.connect(self._on_subtitle_progress)
         self._dl_worker.finished.connect(self._on_download_done)
         self._dl_worker.start()
 
@@ -1260,6 +1288,10 @@ class MainWindow(QMainWindow):
             )
         self._status_label.setText(f"\U0001f4e5 [{done}/{total}]{speed_text} {name[:30]}")
 
+    def _on_subtitle_progress(self, total: int, done: int, name: str) -> None:
+        """字幕嵌入进度回调：更新状态栏显示字幕嵌入状态。"""
+        self._status_label.setText(f"\U0001f4ac 嵌入字幕 [{done}/{total}] {name[:30]}")
+
     def _on_download_done(
         self,
         ok_list: List[Tuple[str, str, int]],
@@ -1308,6 +1340,7 @@ class MainWindow(QMainWindow):
 
         self._status_label.setText(
             f"\u2705 完成: 成功 {len(ok_list)}, 失败 {len(fail_list)}"
+            + (f", 字幕嵌入 {len(embedded_names)}" if embedded_names else "")
         )
 
         # 下载成功后自动取消对应资源的勾选，避免重复下载
@@ -1344,6 +1377,10 @@ class MainWindow(QMainWindow):
 
         # 构建详细错误信息
         msg_parts = [f"成功: {len(ok_list)} 项"]
+        # 字幕嵌入结果
+        embedded_names: list[str] = getattr(self._dl_worker, '_embedded_names', [])
+        if embedded_names:
+            msg_parts.append(f"字幕嵌入: {len(embedded_names)} 项")
         if fail_list:
             msg_parts.append(f"失败: {len(fail_list)} 项")
             # 显示前 5 个错误详情
